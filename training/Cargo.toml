@@ -1,0 +1,12 @@
+[package]
+name = "emwave-trainer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36"
+parking_lot = "0.12"
+hidapi = "2.6"
+
+[profile.release]
+opt-level = 2
