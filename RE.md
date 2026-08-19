@@ -243,3 +243,49 @@ permit DYLD_INSERT_LIBRARIES. The hook logs every IOHIDDeviceSetReport/GetReport
 RegisterInputReportCallback/Open/Close to `/tmp/hid_hook.log`. Running the app's
 File→Sync under the hook reveals the app's EXACT transfer sequence for replication
 in `emwave2.py`.
+
+## 2026-08-19 — Part 7: Android APK port
+
+- Shared egui UI/metrics moved into `training/src/lib.rs`; desktop keeps a thin binary wrapper.
+- Desktop transport remains `hidapi`.
+- Android transport uses Android `UsbManager` via JNI:
+  - enumerates VID `0x0E30` / PID `0x0008`;
+  - requests Android USB host permission with a `PendingIntent`;
+  - opens `UsbDeviceConnection`, duplicates its file descriptor;
+  - uses `nusb` for interface 0 HID interrupt IN `0x81`, interrupt OUT `0x01`, and HID
+    class GET/SET_FEATURE control transfers.
+- Manifest declares `android.hardware.usb.host`; Android activity is portrait/fullscreen by
+  default, with a dedicated narrow-screen layout so the pacer, HR/IBI cards, resonance,
+  graph, and HRV stats stack without horizontal clipping.
+- Android uses eframe `glow` backend. The first wgpu APK was tested on Android 16 emulator
+  and crashed in the emulator's Vulkan driver; the OpenGL/glow APK launches successfully.
+- APK build:
+  `cargo apk build --release --no-default-features --lib --target aarch64-linux-android`
+  with the local debug keystore supplied through `CARGO_APK_RELEASE_KEYSTORE`.
+- Verified on Android 16 Pixel emulator:
+  - APK installs;
+  - NativeActivity launches;
+  - process remains alive;
+  - fullscreen portrait UI renders without horizontal overflow;
+  - emulator has no USB device attached, so physical emWave permission/transfer could not be
+    exercised there.
+## 2026-08-19 — Part 8: Persistent Android diagnostics
+
+- Added a persistent reader log for Android and desktop.
+- Android path:
+  `/sdcard/Android/data/com.emwave.resonance/files/emwave.log`
+- Logged events:
+  - reader thread start;
+  - USB/HID open attempts;
+  - successful session start;
+  - HID read errors;
+  - USB permission/open/interface errors;
+  - reconnect attempts.
+- Retrieve after reconnecting the phone to the computer:
+  `adb pull /sdcard/Android/data/com.emwave.resonance/files/emwave.log`
+
+### Physical Pixel 9 log diagnosis
+- Android permission dialog succeeded.
+- Persistent log then showed repeated `interface is busy (errno 16)`.
+- Root cause: normal `nusb::claim_interface` loses to Android's system HID driver.
+- Android backend changed to `detach_and_claim_interface(0)`; desktop transport unchanged.
