@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import re
-import struct
 import sys
 import time
 
@@ -44,6 +43,15 @@ STAT_RE = re.compile(rb"<1 L=(\d+) T=(\d+) S=(\d+) A=(\d+) E=(\d+)")
 HIDAPI = "/opt/homebrew/opt/hidapi/lib/libhidapi.dylib"
 VID, PID = 0x0E30, 0x0008
 REPORT_LEN = 63  # 1 ID byte + 62 payload
+
+def report_payload(report: bytes) -> bytes | None:
+    """Return the declared payload, or None for a malformed report."""
+    if len(report) < 4:
+        return None
+    length = report[3]
+    if length > len(report) - 4:
+        return None
+    return report[4:4 + length]
 
 
 def _hid_signature(lib: ctypes.CDLL) -> None:
@@ -100,9 +108,9 @@ class EmWave2:
     def send_command(self, cmd: bytes) -> None:
         """Send a text command in an 'S' output report."""
         buf = bytearray(REPORT_LEN)
-        buf[0] = 0x53                      # report ID 'S'
-        buf[3] = len(cmd) & 0xFF           # length byte
-        buf[4:4 + len(cmd)] = cmd          # command text
+        buf[0] = 0x53
+        buf[3] = len(cmd) & 0xFF
+        buf[4:4 + len(cmd)] = cmd
         n = self.lib.hid_write(self._dev, bytes(buf), REPORT_LEN)
         if n < 0:
             raise RuntimeError(f"hid_write failed: {self._err()}")
@@ -111,7 +119,9 @@ class EmWave2:
         """Read one input report (63 bytes) or None on timeout."""
         buf = ctypes.create_string_buffer(REPORT_LEN)
         n = self.lib.hid_read_timeout(self._dev, buf, REPORT_LEN, timeout_ms)
-        if n <= 0:
+        if n < 0:
+            raise RuntimeError(f"hid_read failed: {self._err()}")
+        if n == 0:
             return None
         return buf.raw[:n]
 
@@ -166,17 +176,11 @@ class EmWave2:
         except RuntimeError:
             pass
 
-    def start_blob_download(self) -> None:
-        self.send_command(b"SB\r")             # session blob (stored sessions)
-
-    # -- stream helpers -------------------------------------------------
     def iter_reports(self, report_id: int | None, seconds: float, timeout_ms: int = 1000):
         end = time.time() + seconds
         while time.time() < end:
             rep = self.read_report(timeout_ms)
-            if rep is None:
-                continue
-            if len(rep) < 4:
+            if rep is None or report_payload(rep) is None:
                 continue
             if report_id is not None and rep[0] != report_id:
                 continue
@@ -210,15 +214,19 @@ def cmd_ibi(d: EmWave2, args) -> int:
         n = 0
         buf = b""
         for rep in d.iter_reports(0x75, args.seconds):   # 'u'
-            buf += rep[4:4 + rep[3]]
+            payload = report_payload(rep)
+            if payload is None:
+                continue
+            buf += payload
             while b"\r" in buf:                          # records end with \r
                 line, buf = buf.split(b"\r", 1)
                 if line.strip():
                     emit(line)
         if buf.strip():
             emit(buf)
-    except Exception as e:
-        print(f"[!] stream error: {e}")
+    except RuntimeError as error:
+        print(f"[!] stream error: {error}", file=sys.stderr)
+        return 1
     finally:
         d.stop_session()
     print(f"[*] {n} IBI records")
@@ -234,7 +242,9 @@ def cmd_ppg(d: EmWave2, args) -> int:
     try:
         n = 0
         for rep in d.iter_reports(None, args.seconds):
-            payload = rep[4:4 + rep[3]]
+            payload = report_payload(rep)
+            if payload is None:
+                continue
             if rep[0] == 0x70 and payload:
                 text = payload.decode("ascii", "replace")
                 print(f"echo({len(payload)}B): {text!r}")
@@ -243,8 +253,9 @@ def cmd_ppg(d: EmWave2, args) -> int:
                 text = payload.decode("ascii", "replace")
                 print(f"id=0x{rep[0]:02x} len={len(payload)}: {text!r}")
                 n += 1
-    except Exception as e:
-        print(f"[!] stream error: {e}")
+    except RuntimeError as error:
+        print(f"[!] stream error: {error}", file=sys.stderr)
+        return 1
     finally:
         d.stop_session()
     print(f"[*] {n} reports captured")
@@ -258,7 +269,9 @@ def cmd_events(d: EmWave2, args) -> int:
         for rep in d.iter_reports(None, args.seconds):
             rid = rep[0]
             if rid in (0x65, 0x66, 0x53):     # 'e' events, 'f' data, 'S' ACK echo
-                payload = rep[4:4 + rep[3]]
+                payload = report_payload(rep)
+                if payload is None:
+                    continue
                 print(f"id=0x{rid:02x} seq={rep[1] | (rep[2] << 8):04x}: {payload.hex(' ')} "
                       f"'{payload.decode('ascii', 'replace')}'")
     finally:
@@ -290,14 +303,17 @@ def cmd_sessions(d: EmWave2, args) -> int:
         rep = d.read_report(2000)
         if rep is None:
             continue
+        payload = report_payload(rep)
+        if payload is None:
+            continue
         rid = rep[0]
-        if rid == 0x46:                            # 'F' binary blob block
-            fblocks += rep[4:4 + rep[3]]
+        if rid == 0x46:
+            fblocks += payload
             n += 1
-        elif rid == 0x66:                          # 'f' text session records
-            text += rep[4:4 + rep[3]]
-            if b"\r" in rep[4:4 + rep[3]] or n == 0:
-                sys.stdout.write(rep[4:4 + rep[3]].decode("ascii", "replace"))
+        elif rid == 0x66:
+            text += payload
+            if b"\r" in payload or n == 0:
+                sys.stdout.write(payload.decode("ascii", "replace"))
                 sys.stdout.flush()
     out = args.out or "emwave2_sessions.bin"
     with open(out, "wb") as f:
@@ -328,7 +344,8 @@ def cmd_firmware(d: EmWave2, args) -> int:
     n = 0
     while time.time() < end:
         rep = d.read_report(2000)
-        if rep is None or rep[0] != 0x46:
+        payload = report_payload(rep) if rep is not None else None
+        if payload is None or rep[0] != 0x46 or len(rep) < 8:
             continue
         addr = int.from_bytes(rep[3:7], "little")
         length = rep[7]
@@ -352,10 +369,13 @@ def cmd_raw(d: EmWave2, args) -> int:
     d.start_session()
     try:
         for rep in d.iter_reports(None, args.seconds):
-            print(f"id=0x{rep[0]:02x} seq={rep[1] | (rep[2] << 8):04x} len={rep[3]:3d} "
-                  f"{rep[4:4 + rep[3]].hex(' ')} '{rep[4:4 + rep[3]].decode('ascii', 'replace')}'")
-    except Exception as e:
-        print(f"[!] stream error: {e}")
+            payload = report_payload(rep)
+            print(f"id=0x{rep[0]:02x} seq={rep[1] | (rep[2] << 8):04x} "
+                  f"len={len(payload):3d} {payload.hex(' ')} "
+                  f"'{payload.decode('ascii', 'replace')}'")
+    except RuntimeError as error:
+        print(f"[!] stream error: {error}", file=sys.stderr)
+        return 1
     finally:
         d.stop_session()
     return 0

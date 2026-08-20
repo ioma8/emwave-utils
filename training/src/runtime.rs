@@ -8,131 +8,144 @@ pub(crate) const TRIAL_SECONDS: f64 = 120.0;
 pub(crate) const REST_SECONDS: f64 = 120.0;
 pub(crate) const MIN_TRIAL_DATA_SECONDS: f64 = 108.0;
 pub(crate) const PARTIAL_MIN_TRIAL_SECONDS: f64 = 30.0;
-
 #[derive(Clone)]
 pub(crate) struct TrialResult {
     pub(crate) rate: f64,
-    pub(crate) alignment: Option<TrialAlignment>,
+    pub(crate) alignment: TrialAlignment,
 }
 
+#[derive(Default)]
+enum FinderState {
+    #[default]
+    Idle,
+    Trial {
+        started: Instant,
+        data_started_s: Option<f64>,
+        run_all: bool,
+    },
+    Rest {
+        started: Instant,
+        next_rate: usize,
+    },
+}
+
+#[derive(Default)]
 pub(crate) struct FinderRuntime {
-    pub(crate) active: bool,
-    pub(crate) started: Option<Instant>,
-    pub(crate) rest_started: Option<Instant>,
-    pub(crate) resting: bool,
-    pub(crate) data_started_s: Option<f64>,
+    state: FinderState,
     pub(crate) rate_index: usize,
-    pub(crate) run_all: bool,
     pub(crate) interrupted: bool,
     pub(crate) results: Vec<TrialResult>,
 }
 
-impl Default for FinderRuntime {
-    fn default() -> Self {
-        Self {
-            active: false,
-            started: None,
-            rest_started: None,
-            resting: false,
-            data_started_s: None,
-            rate_index: 0,
-            run_all: false,
-            interrupted: false,
-            results: Vec::new(),
+impl FinderRuntime {
+    pub(crate) fn active(&self) -> bool {
+        !matches!(self.state, FinderState::Idle)
+    }
+
+    pub(crate) fn resting(&self) -> bool {
+        matches!(self.state, FinderState::Rest { .. })
+    }
+
+    pub(crate) fn run_all(&self) -> bool {
+        matches!(self.state, FinderState::Trial { run_all: true, .. })
+            || matches!(self.state, FinderState::Rest { .. })
+    }
+
+    pub(crate) fn trial_elapsed(&self) -> f64 {
+        match self.state {
+            FinderState::Trial { started, .. } => started.elapsed().as_secs_f64(),
+            _ => 0.0,
         }
     }
-}
 
-impl FinderRuntime {
-    pub(crate) fn start_trial(
-        &mut self,
-        rate_index: usize,
-        run_all: bool,
-        snap: &Snapshot,
-    ) {
-        self.active = true;
-        self.started = Some(Instant::now());
-        self.rest_started = None;
-        self.resting = false;
-        self.data_started_s = snap.analysis_received.last().map(|&(time, _)| time);
+    pub(crate) fn rest_elapsed(&self) -> f64 {
+        match self.state {
+            FinderState::Rest { started, .. } => started.elapsed().as_secs_f64(),
+            _ => 0.0,
+        }
+    }
+
+    pub(crate) fn data_started_s(&self) -> Option<f64> {
+        match self.state {
+            FinderState::Trial { data_started_s, .. } => data_started_s,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn start_trial(&mut self, rate_index: usize, run_all: bool, snap: &Snapshot) {
         self.rate_index = rate_index.min(FINDER_RATES.len() - 1);
-        self.run_all = run_all;
         self.interrupted = false;
+        self.state = FinderState::Trial {
+            started: Instant::now(),
+            data_started_s: snap.analysis_received.last().map(|&(time, _)| time),
+            run_all,
+        };
     }
 
     pub(crate) fn finish_trial(&mut self, snap: &Snapshot, minimum_span_s: f64) {
         let rate = FINDER_RATES[self.rate_index];
-        let alignment = self.data_started_s.and_then(|start| {
-            metrics::trial_alignment(
-                &snap.analysis_received,
-                start,
-                rate,
-                minimum_span_s,
-            )
-        });
-        if let Some(alignment) = alignment {
-            let result = TrialResult {
-                rate,
-                alignment: Some(alignment),
-            };
-            if let Some(existing) = self
-                .results
-                .iter_mut()
-                .find(|existing| (existing.rate - rate).abs() < 0.01)
+        let data_started_s = self.data_started_s();
+        if let Some(start) = data_started_s {
+            if let Some(alignment) =
+                metrics::trial_alignment(&snap.analysis_received, start, rate, minimum_span_s)
             {
-                *existing = result;
-            } else {
-                self.results.push(result);
+                let result = TrialResult { rate, alignment };
+                if let Some(existing) = self
+                    .results
+                    .iter_mut()
+                    .find(|existing| (existing.rate - rate).abs() < 0.01)
+                {
+                    *existing = result;
+                } else {
+                    self.results.push(result);
+                }
             }
         }
 
         let next = self.rate_index + 1;
-        if self.run_all && next < FINDER_RATES.len() {
+        if self.run_all() && next < FINDER_RATES.len() {
             self.rate_index = next;
-            self.started = None;
-            self.rest_started = Some(Instant::now());
-            self.resting = true;
+            self.state = FinderState::Rest {
+                started: Instant::now(),
+                next_rate: next,
+            };
         } else {
-            self.active = false;
-            self.started = None;
-            self.rest_started = None;
-            self.resting = false;
-            self.data_started_s = None;
-            self.run_all = false;
+            self.state = FinderState::Idle;
         }
     }
 
     pub(crate) fn update(&mut self, snap: &Snapshot) {
-        if !self.active {
+        if !self.active() {
             return;
         }
         if !snap.connected {
-            self.run_all = false;
-            if !self.resting {
-                self.finish_trial(snap, PARTIAL_MIN_TRIAL_SECONDS);
+            if self.resting() {
+                self.state = FinderState::Idle;
             } else {
-                self.active = false;
-                self.rest_started = None;
-                self.resting = false;
+                self.finish_trial(snap, PARTIAL_MIN_TRIAL_SECONDS);
+                self.state = FinderState::Idle;
             }
             self.interrupted = true;
             return;
         }
-        if self.resting {
-            if self
-                .rest_started
-                .is_some_and(|started| started.elapsed().as_secs_f64() >= REST_SECONDS)
-            {
-                let next = self.rate_index;
-                self.start_trial(next, true, snap);
+        if let FinderState::Rest { started, next_rate } = self.state {
+            if started.elapsed().as_secs_f64() >= REST_SECONDS {
+                self.start_trial(next_rate, true, snap);
             }
             return;
         }
-        if self
-            .started
-            .is_some_and(|started| started.elapsed().as_secs_f64() >= TRIAL_SECONDS)
-        {
+        if self.trial_elapsed() >= TRIAL_SECONDS {
             self.finish_trial(snap, MIN_TRIAL_DATA_SECONDS);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_rest_for_test(&mut self) {
+        if let FinderState::Rest { next_rate, .. } = self.state {
+            self.state = FinderState::Rest {
+                started: Instant::now() - std::time::Duration::from_secs(REST_SECONDS as u64 + 1),
+                next_rate,
+            };
         }
     }
 }

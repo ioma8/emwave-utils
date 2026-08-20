@@ -3,11 +3,10 @@
 //! Desktop uses hidapi. Android uses UsbManager permission + UsbDeviceConnection's
 //! fd, then nusb for HID control/interrupt transfers.
 
-
 #[cfg(not(target_os = "android"))]
 mod platform {
-    use hidapi::{HidApi, HidDevice};
     use crate::protocol::{HidTransport, REPORT_LEN};
+    use hidapi::{HidApi, HidDevice};
 
     const VID: u16 = 0x0e30;
     const PID: u16 = 0x0008;
@@ -28,22 +27,7 @@ mod platform {
             Ok(d)
         }
 
-        fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
-            let mut buf = vec![0u8; size + 1];
-            buf[0] = report_id;
-            let n = self.dev.get_feature_report(&mut buf).map_err(|e| e.to_string())?;
-            Ok(buf[..n].to_vec())
-        }
-
-        fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<(), String> {
-            let mut buf = vec![report_id];
-            buf.extend_from_slice(payload);
-            self.dev.send_feature_report(&buf).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-
-
-        pub fn read_report(&self, timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
+        pub fn read_report(&mut self, timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
             let mut buf = [0u8; 64];
             match self.dev.read_timeout(&mut buf, timeout_ms) {
                 Ok(n) if n > 0 => Ok(Some(buf[..n].to_vec())),
@@ -54,11 +38,21 @@ mod platform {
     }
     impl HidTransport for Device {
         fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
-            Device::get_feature(self, report_id, size)
+            let mut buf = vec![0u8; size + 1];
+            buf[0] = report_id;
+            let n = self
+                .dev
+                .get_feature_report(&mut buf)
+                .map_err(|e| e.to_string())?;
+            Ok(buf[..n].to_vec())
         }
 
         fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<(), String> {
-            Device::set_feature(self, report_id, payload)
+            let mut buf = vec![report_id];
+            buf.extend_from_slice(payload);
+            self.dev
+                .send_feature_report(&buf)
+                .map_err(|e| e.to_string())
         }
 
         fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), String> {
@@ -218,7 +212,9 @@ mod platform {
             .z()
             .map_err(jni_error)?;
         if !permission {
-            let action = env.new_string("com.emwave.resonance.USB_PERMISSION").map_err(jni_error)?;
+            let action = env
+                .new_string("com.emwave.resonance.USB_PERMISSION")
+                .map_err(jni_error)?;
             let intent = env
                 .new_object(
                     "android/content/Intent",
@@ -309,6 +305,13 @@ mod platform {
             Ok(d)
         }
 
+        pub fn read_report(&mut self, _timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
+            let mut buf = [0u8; 64];
+            let n = self.reader.read(&mut buf).map_err(|e| e.to_string())?;
+            Ok((n > 0).then(|| buf[..n].to_vec()))
+        }
+    }
+    impl HidTransport for Device {
         fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
             let data = self
                 .usb
@@ -347,22 +350,6 @@ mod platform {
                 .map_err(|e| e.to_string())
         }
 
-
-        pub fn read_report(&mut self, _timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
-            let mut buf = [0u8; 64];
-            let n = self.reader.read(&mut buf).map_err(|e| e.to_string())?;
-            Ok((n > 0).then(|| buf[..n].to_vec()))
-        }
-    }
-    impl HidTransport for Device {
-        fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
-            Device::get_feature(self, report_id, size)
-        }
-
-        fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<(), String> {
-            Device::set_feature(self, report_id, payload)
-        }
-
         fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), String> {
             self.writer.write_all(report).map_err(|e| e.to_string())?;
             self.writer.flush().map_err(|e| e.to_string())
@@ -378,9 +365,3 @@ pub use platform::{set_keep_screen_on, AndroidContext};
 #[cfg(not(target_os = "android"))]
 #[derive(Clone, Copy)]
 pub struct AndroidContext;
-
-#[cfg(not(target_os = "android"))]
-#[allow(dead_code)]
-pub fn set_keep_screen_on(_ctx: AndroidContext, _enabled: bool) -> Result<(), String> {
-    Ok(())
-}

@@ -5,7 +5,7 @@ every open client, and the device echoes host commands on the 'p' channel, so th
 captures both directions during another app's session."""
 import sys
 import time
-from emwave2 import EmWave2
+from emwave2 import EmWave2, report_payload
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/emwave2_capture.txt"
 SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 300
@@ -20,8 +20,10 @@ with open(OUT, "w") as f:
         if rep is None:
             continue
         ts = time.time() - t0
-        payload = rep[4:4 + rep[3]] if rep[3] < 60 else rep[4:]
-        line = f"{ts:8.3f} id=0x{rep[0]:02x} seq={rep[1]|(rep[2]<<8):04x} len={rep[3]:3d} {payload.hex(' ')} '{payload.decode('ascii','replace')}'"
+        payload = report_payload(rep)
+        if payload is None:
+            continue
+        line = f"{ts:8.3f} id=0x{rep[0]:02x} seq={rep[1]|(rep[2]<<8):04x} len={len(payload):3d} {payload.hex(' ')} '{payload.decode('ascii','replace')}'"
         print(line, flush=True)
         f.write(line + "\n")
         f.flush()

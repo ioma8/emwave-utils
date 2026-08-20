@@ -50,14 +50,38 @@ fn detrend_hann(values: &mut [f64]) {
         *value = (*value - trend) * window;
     }
 }
+fn resample(ibis: &[(f64, f64)], span: f64) -> Vec<f64> {
+    let npts = (span * 4.0) as usize;
+    if npts < 16 || ibis.len() < 2 {
+        return Vec::new();
+    }
+    let start = ibis[0].0;
+    let mut values = Vec::with_capacity(npts);
+    let mut j = 0;
+    for index in 0..npts {
+        let x = start + index as f64 / 4.0;
+        while j + 1 < ibis.len() && ibis[j + 1].0 < x {
+            j += 1;
+        }
+        if j + 1 >= ibis.len() {
+            break;
+        }
+        let (t0, y0) = ibis[j];
+        let (t1, y1) = ibis[j + 1];
+        values.push(if t1 > t0 {
+            y0 + (y1 - y0) * (x - t0) / (t1 - t0)
+        } else {
+            y0
+        });
+    }
+    values
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrialAlignment {
     pub score: f64,
     pub peak_bpm: f64,
     pub mismatch_bpm: f64,
-    pub target_peak_ratio: f64,
-    pub lf_nu: f64,
     pub span_s: f64,
     pub reliable: bool,
 }
@@ -69,15 +93,16 @@ pub fn hrv_metrics(series: &NnSeries) -> Option<HrvMetrics> {
     if n < 4 {
         return None;
     }
-    let nn: Vec<f64> = ibis.iter().map(|&(_, m)| m).collect();
-    let mean_rr = nn.iter().sum::<f64>() / n as f64;
-
-    let var = nn.iter().map(|v| (v - mean_rr).powi(2)).sum::<f64>();
+    let mean_rr = ibis.iter().map(|&(_, ibi)| ibi).sum::<f64>() / n as f64;
+    let var = ibis
+        .iter()
+        .map(|&(_, ibi)| (ibi - mean_rr).powi(2))
+        .sum::<f64>();
     let sdnn = (var / (n - 1) as f64).sqrt();
 
     let (mut ssd, mut nn50) = (0.0, 0.0);
-    for i in 1..n {
-        let d = nn[i] - nn[i - 1];
+    for pair in ibis.windows(2) {
+        let d = pair[1].1 - pair[0].1;
         ssd += d * d;
         if d.abs() > 50.0 {
             nn50 += 1.0;
@@ -85,13 +110,7 @@ pub fn hrv_metrics(series: &NnSeries) -> Option<HrvMetrics> {
     }
     let rmssd = (ssd / (n - 1) as f64).sqrt();
     let pnn50 = nn50 / (n - 1) as f64 * 100.0;
-
-
-    Some(HrvMetrics {
-        sdnn,
-        rmssd,
-        pnn50,
-    })
+    Some(HrvMetrics { sdnn, rmssd, pnn50 })
 }
 
 /// Frequency-domain analysis + resonance score over clean NN intervals.
@@ -104,34 +123,15 @@ fn resonance_raw(ibis: &[(f64, f64)]) -> Option<Resonance> {
     if n < 16 {
         return None;
     }
-    let t: Vec<f64> = ibis.iter().map(|&(t, _)| t).collect();
-    let y: Vec<f64> = ibis.iter().map(|&(_, m)| m).collect();
-    let span = t[n - 1] - t[0];
+    let span = ibis[n - 1].0 - ibis[0].0;
     if span < 12.0 {
         return None;
     }
-
     let fs = 4.0;
-    let npts = (span * fs) as usize;
+    let mut yi = resample(ibis, span);
+    let npts = yi.len();
     if npts < 16 {
         return None;
-    }
-
-    // Linear-interpolate NN to a uniform 4 Hz grid.
-    let mut yi = Vec::with_capacity(npts);
-    let mut j = 0usize;
-    for k in 0..npts {
-        let x = t[0] + k as f64 / fs;
-        while j + 1 < n && t[j + 1] < x {
-            j += 1;
-        }
-        let (t0, t1) = (t[j], t[j + 1]);
-        let v = if t1 > t0 {
-            y[j] + (y[j + 1] - y[j]) * (x - t0) / (t1 - t0)
-        } else {
-            y[j]
-        };
-        yi.push(v);
     }
 
     // Remove linear drift before applying the Hann taper.
@@ -140,14 +140,14 @@ fn resonance_raw(ibis: &[(f64, f64)]) -> Option<Resonance> {
     // Direct DFT -> power spectrum.
     let nf = npts / 2;
     let mut power = vec![0.0f64; nf];
-    for k in 0..nf {
+    for (k, value) in power.iter_mut().enumerate() {
         let wk = 2.0 * PI * k as f64 / npts as f64;
         let (mut re, mut im) = (0.0, 0.0);
         for (idx, &v) in yi.iter().enumerate() {
             re += v * (wk * idx as f64).cos();
             im -= v * (wk * idx as f64).sin();
         }
-        power[k] = re * re + im * im;
+        *value = re * re + im * im;
     }
     let freq = |k: usize| k as f64 * fs / npts as f64;
 
@@ -161,29 +161,25 @@ fn resonance_raw(ibis: &[(f64, f64)]) -> Option<Resonance> {
             .sum()
     };
 
-    let vlf = band(0.0033, 0.04);
     let lf = band(0.04, 0.15);
     let hf = band(0.15, 0.40);
     let total_lf_hf = lf + hf;
     if total_lf_hf <= 0.0 {
         return None;
     }
-    let _ = vlf; // VLF needs >5 min to be valid; computed but not surfaced.
-
     let lf_nu = lf / total_lf_hf * 100.0;
     let hf_nu = hf / total_lf_hf * 100.0;
-    // LF/HF remains available through the band powers; no UI consumes the ratio.
 
     // Dominant peak within the LF band + its prominence over the median LF bin.
     let mut peak_freq = 0.1;
     let mut peak_power = 0.0;
     let mut lf_powers: Vec<f64> = Vec::new();
-    for k in 0..nf {
+    for (k, &value) in power.iter().enumerate() {
         let f = freq(k);
         if (0.04..=0.15).contains(&f) {
-            lf_powers.push(power[k]);
-            if power[k] > peak_power {
-                peak_power = power[k];
+            lf_powers.push(value);
+            if value > peak_power {
+                peak_power = value;
                 peak_freq = f;
             }
         }
@@ -248,25 +244,7 @@ pub fn trial_alignment(
 
     let base = resonance_raw(data)?;
     let fs = 4.0;
-    let npts = (span * fs) as usize;
-    let mut yi = Vec::with_capacity(npts);
-    let mut j = 0usize;
-    for k in 0..npts {
-        let x = data[0].0 + k as f64 / fs;
-        while j + 1 < n && data[j + 1].0 < x {
-            j += 1;
-        }
-        if j + 1 >= n {
-            break;
-        }
-        let (t0, y0) = data[j];
-        let (t1, y1) = data[j + 1];
-        yi.push(if t1 > t0 {
-            y0 + (y1 - y0) * (x - t0) / (t1 - t0)
-        } else {
-            y0
-        });
-    }
+    let mut yi = resample(data, span);
     if yi.len() < 16 {
         return None;
     }
@@ -305,11 +283,6 @@ pub fn trial_alignment(
     let concentration = (prominence.log10() / 2.0).clamp(0.0, 1.0);
     let peak_bpm = peak_frequency * 60.0;
     let mismatch_bpm = (peak_bpm - target_bpm).abs();
-    let target_peak_ratio = if peak_power > 0.0 {
-        target_power / peak_power
-    } else {
-        0.0
-    };
     // Score the target response independently; mismatch only controls status.
     let score = base.lf_nu * concentration;
     let reliable = mismatch_bpm <= 0.5 && score >= 35.0;
@@ -317,8 +290,6 @@ pub fn trial_alignment(
         score,
         peak_bpm,
         mismatch_bpm,
-        target_peak_ratio,
-        lf_nu: base.lf_nu,
         span_s: span,
         reliable,
     })

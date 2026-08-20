@@ -580,6 +580,7 @@ dependencies = [
  "jni 0.21.1",
  "libc",
  "nusb",
+ "parking_lot",
  "serde",
  "serde_json",
  "winit",
