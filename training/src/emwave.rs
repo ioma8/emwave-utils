@@ -3,11 +3,11 @@
 //! Desktop uses hidapi. Android uses UsbManager permission + UsbDeviceConnection's
 //! fd, then nusb for HID control/interrupt transfers.
 
-pub const REPORT_LEN: usize = 63;
 
 #[cfg(not(target_os = "android"))]
 mod platform {
     use hidapi::{HidApi, HidDevice};
+    use crate::protocol::{HidTransport, REPORT_LEN};
 
     const VID: u16 = 0x0e30;
     const PID: u16 = 0x0008;
@@ -23,10 +23,8 @@ mod platform {
             let dev = api
                 .open(VID, PID)
                 .map_err(|_| "emWave2 not found (plug it in; check HID access)".to_string())?;
-            let d = Self { _api: api, dev };
-            d.session_flag(true)?;
-            d.send_command(b"J-\r")?;
-            d.send_command(b"SR\r")?;
+            let mut d = Self { _api: api, dev };
+            d.start_session()?;
             Ok(d)
         }
 
@@ -44,23 +42,6 @@ mod platform {
             Ok(())
         }
 
-        fn session_flag(&self, on: bool) -> Result<(), String> {
-            let cur = self.get_feature(0x72, 2)?;
-            let b = cur.get(1).copied().unwrap_or(0);
-            self.set_feature(0x72, &[(b & 0x80) | u8::from(on)])
-        }
-
-        fn send_command(&self, cmd: &[u8]) -> Result<(), String> {
-            let mut buf = [0u8; super::REPORT_LEN];
-            buf[0] = 0x53;
-            buf[3] = cmd.len() as u8;
-            buf[4..4 + cmd.len()].copy_from_slice(cmd);
-            let n = self.dev.write(&buf).map_err(|e| e.to_string())?;
-            if n < super::REPORT_LEN {
-                return Err("short write".to_string());
-            }
-            Ok(())
-        }
 
         pub fn read_report(&self, timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
             let mut buf = [0u8; 64];
@@ -71,10 +52,28 @@ mod platform {
             }
         }
     }
+    impl HidTransport for Device {
+        fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
+            Device::get_feature(self, report_id, size)
+        }
+
+        fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<(), String> {
+            Device::set_feature(self, report_id, payload)
+        }
+
+        fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), String> {
+            let n = self.dev.write(report).map_err(|e| e.to_string())?;
+            if n < REPORT_LEN {
+                return Err("short write".to_string());
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
 mod platform {
+    use crate::protocol::{HidTransport, REPORT_LEN};
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     use std::time::Duration;
@@ -84,7 +83,6 @@ mod platform {
     use jni::JavaVM;
     use nusb::transfer::{ControlIn, ControlOut, ControlType, In, Interrupt, Out, Recipient};
     use nusb::MaybeFuture;
-
     const VID: i32 = 0x0e30;
     const PID: i32 = 0x0008;
 
@@ -95,7 +93,27 @@ mod platform {
         pub vm: usize,
         pub activity: usize,
     }
-
+    pub fn set_keep_screen_on(ctx: AndroidContext, enabled: bool) -> Result<(), String> {
+        let vm = unsafe { JavaVM::from_raw(ctx.vm as *mut _) }.map_err(jni_error)?;
+        let mut env = vm.attach_current_thread().map_err(jni_error)?;
+        let activity = unsafe { JObject::from_raw(ctx.activity as jobject) };
+        if activity.is_null() {
+            return Err("Android activity reference is null".into());
+        }
+        let window = env
+            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
+            .map_err(jni_error)?
+            .l()
+            .map_err(jni_error)?;
+        if window.is_null() {
+            return Err("Android window reference is null".into());
+        }
+        let flags = 0x0000_0080; // FLAG_KEEP_SCREEN_ON
+        let method = if enabled { "addFlags" } else { "clearFlags" };
+        env.call_method(&window, method, "(I)V", &[JValue::Int(flags)])
+            .map_err(jni_error)?;
+        Ok(())
+    }
     unsafe impl Send for AndroidContext {}
     unsafe impl Sync for AndroidContext {}
 
@@ -114,6 +132,9 @@ mod platform {
         let vm = unsafe { JavaVM::from_raw(ctx.vm as *mut _) }.map_err(jni_error)?;
         let mut env = vm.attach_current_thread().map_err(jni_error)?;
         let activity = unsafe { JObject::from_raw(ctx.activity as jobject) };
+        if activity.is_null() {
+            return Err("Android activity reference is null".into());
+        }
         let service = env.new_string("usb").map_err(jni_error)?;
         let manager = env
             .call_method(
@@ -125,22 +146,33 @@ mod platform {
             .map_err(jni_error)?
             .l()
             .map_err(jni_error)?;
+        if manager.is_null() {
+            return Err("Android UsbManager unavailable".into());
+        }
         let devices = env
             .call_method(&manager, "getDeviceList", "()Ljava/util/HashMap;", &[])
             .map_err(jni_error)?
             .l()
             .map_err(jni_error)?;
+        if devices.is_null() {
+            return Err("Android UsbManager returned no device map".into());
+        }
         let values = env
             .call_method(&devices, "values", "()Ljava/util/Collection;", &[])
             .map_err(jni_error)?
             .l()
             .map_err(jni_error)?;
+        if values.is_null() {
+            return Err("Android USB device collection is null".into());
+        }
         let iter = env
             .call_method(&values, "iterator", "()Ljava/util/Iterator;", &[])
             .map_err(jni_error)?
             .l()
             .map_err(jni_error)?;
-
+        if iter.is_null() {
+            return Err("Android USB device iterator is null".into());
+        }
         let mut found: Option<JObject> = None;
         loop {
             let has = env
@@ -156,6 +188,9 @@ mod platform {
                 .map_err(jni_error)?
                 .l()
                 .map_err(jni_error)?;
+            if dev.is_null() {
+                continue;
+            }
             let vendor = env
                 .call_method(&dev, "getVendorId", "()I", &[])
                 .map_err(jni_error)?
@@ -226,6 +261,9 @@ mod platform {
             .map_err(jni_error)?
             .l()
             .map_err(jni_error)?;
+        if connection.is_null() {
+            return Err("UsbManager.openDevice returned null".into());
+        }
         let fd = env
             .call_method(&connection, "getFileDescriptor", "()I", &[])
             .map_err(jni_error)?
@@ -267,9 +305,7 @@ mod platform {
                 reader,
                 writer,
             };
-            d.session_flag(true)?;
-            d.send_command(b"J-\r")?;
-            d.send_command(b"SR\r")?;
+            d.start_session()?;
             Ok(d)
         }
 
@@ -311,20 +347,6 @@ mod platform {
                 .map_err(|e| e.to_string())
         }
 
-        fn session_flag(&self, on: bool) -> Result<(), String> {
-            let cur = self.get_feature(0x72, 2)?;
-            let b = cur.get(1).copied().unwrap_or(0);
-            self.set_feature(0x72, &[(b & 0x80) | u8::from(on)])
-        }
-
-        fn send_command(&mut self, cmd: &[u8]) -> Result<(), String> {
-            let mut buf = [0u8; super::REPORT_LEN];
-            buf[0] = 0x53;
-            buf[3] = cmd.len() as u8;
-            buf[4..4 + cmd.len()].copy_from_slice(cmd);
-            self.writer.write_all(&buf).map_err(|e| e.to_string())?;
-            self.writer.flush().map_err(|e| e.to_string())
-        }
 
         pub fn read_report(&mut self, _timeout_ms: i32) -> Result<Option<Vec<u8>>, String> {
             let mut buf = [0u8; 64];
@@ -332,13 +354,33 @@ mod platform {
             Ok((n > 0).then(|| buf[..n].to_vec()))
         }
     }
+    impl HidTransport for Device {
+        fn get_feature(&self, report_id: u8, size: usize) -> Result<Vec<u8>, String> {
+            Device::get_feature(self, report_id, size)
+        }
+
+        fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<(), String> {
+            Device::set_feature(self, report_id, payload)
+        }
+
+        fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), String> {
+            self.writer.write_all(report).map_err(|e| e.to_string())?;
+            self.writer.flush().map_err(|e| e.to_string())
+        }
+    }
 }
 
 pub use platform::Device;
 
 #[cfg(target_os = "android")]
-pub use platform::AndroidContext;
+pub use platform::{set_keep_screen_on, AndroidContext};
 
 #[cfg(not(target_os = "android"))]
 #[derive(Clone, Copy)]
 pub struct AndroidContext;
+
+#[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
+pub fn set_keep_screen_on(_ctx: AndroidContext, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}

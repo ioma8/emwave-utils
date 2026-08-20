@@ -1,16 +1,18 @@
-# HRV coherence & biofeedback: validated formulas for emwave_tui
+# HRV coherence & biofeedback: validated formulas for Resonance
 
 ## Bottom line
 
-`emwave_tui.py` reports **standardized HRV metrics** from the 1996 Task Force report and
-subsequent peer-reviewed standards, plus a **baroreflex-resonance score** grounded in the
-resonance-frequency biofeedback literature. It does **not** use HeartMath's proprietary
+The Rust `training/` app reports standardized HRV metrics and a transparent
+cardiac PPG target-frequency heuristic. It does not use HeartMath's proprietary
 coherence formula (excluded per project decision; see §5).
 
-What it can honestly show in 30–120 s: signal quality, heart rate, RMSSD/SDNN (descriptive),
-and whether the heart-rhythm power is concentrating around the paced-breathing frequency
-(resonance alignment). What it cannot show: "emotion", stress, autonomic balance, or any
-diagnostic state — none of those are inferable from a single short PPG-IBI stream.
+What it can honestly show in 30–120 s: signal quality, heart rate, RMSSD/SDNN
+(descriptive), and whether heart-rhythm power concentrates around a paced
+breathing frequency. What it cannot show without synchronized respiration:
+phase synchrony, validated personal resonance frequency, autonomic balance, or
+baroreflex gain.
+It does not infer diagnostic states or establish personal resonance frequency; that
+requires separate paced trials with synchronized respiration measurement.
 
 ## 1. Standards basis (primary sources)
 
@@ -94,21 +96,191 @@ HeartMath's coherence ratio — peak power in a 0.030-Hz window centered on the 
 0.04–0.26 Hz, divided by (total − peak) — is described publicly (McCraty 2022,
 [PMC9214473](https://pmc.ncbi.nlm.nih.gov/articles/PMC9214473/)) but the exact
 preprocessing, windowing, artifact correction, and ratio→Low/Medium/High score mapping are
-proprietary and not reproducible. Per project decision, `emwave_tui.py` uses only the
-standardized, independently validated metrics above and does not claim emWave-equivalent
-scores.
+proprietary and not reproducible. Per project decision, the Rust `training/` app uses only
+the standardized metrics and transparent cardiac target-frequency heuristic; it does not
+claim emWave-equivalent scores.
 
-## 6. Session-length guidance
+## 6. What the app's 240-beat window means
 
-- **RMSSD**: meaningful from ~30 s (Shaffer & Ginsberg 2017; ultra-short-term proposals).
-- **LF/HF, LF peak, resonance score**: require ≥ ~2 min for stable spectral estimates;
-  64–120 s gives an initial resonance readout, not a clinical value.
-- **VLF**: ≥ 5 min minimum — shown for completeness, labeled unreliable at shorter spans.
-- **SDNN**: 5 min standard; short-window value is descriptive.
+`HeartStream(window_beats=240)` is a **beat-count window, not a time window**. On each
+qualified IBI record, the stream advances its cumulative physiological time. Records
+whose flag is not `T` are appended to `ibis`, and once more than 240 such clean NN
+intervals are present only the most recent 240 remain. `T` records advance the time axis
+and are counted as artifacts, but are excluded from `ibis` and therefore from all metrics.
+`hrv_metrics()` and `resonance()` recompute on that latest clean-interval set. The Rust
+finder uses receipt-time boundaries for its explicit multi-rate trials.
 
-## 7. Artifact correction
+The represented duration therefore varies with heart rate:
 
-Only `R=F` (clean) beats enter the NN series. `R=T` beats advance the physiological time
-axis (their IBI duration is added) but are excluded from all metrics and counted as
-artifacts. This mirrors the standard "remove ectopic/artifactual beats, preserve timing"
-guidance (Task Force 1996; Shaffer & Meehan 2020 §Resonance Frequency Trials).
+| Mean HR | Approximate duration of 240 beats |
+|---:|---:|
+| 50 bpm | 4.8 min |
+| 60 bpm | 4.0 min |
+| 75 bpm | 3.2 min |
+| 100 bpm | 2.4 min |
+
+This is an estimate (`240 × 60 / HR`); artifact gaps can make elapsed wall/physiological
+time longer, while the number of usable NN intervals remains capped at 240.
+
+## 7. Evidence on duration and window choice (non-HeartMath)
+
+The following separates what the sources found from what we recommend for this app.
+
+| Metric / analysis | Evidence | Consequence for this app |
+|---|---|---|
+| **RMSSD** | The Task Force standard is a 5-min short-term recording, but later validation studies support shorter, purpose-specific estimates. In a large adult sample (*N* = 3,387), Munoz et al. found no benefit from recordings longer than 120 s for RMSSD and found a single 10-s ECG could be valid, although averaging several 10-s segments was preferable. Melo et al. found RMSSD was the most reliable index across 1-, 2-, and 3-min epochs versus 6 min, but controlled breathing changed mean values. [Laborde et al.](https://doi.org/10.3389/fpsyg.2017.00213) summarize the evidence; primary studies: [Munoz et al. 2015](https://doi.org/10.1371/journal.pone.0138921), [Melo et al. 2018](https://doi.org/10.1111/anec.12565). | RMSSD can be shown as an **ultra-short descriptive/training signal** after at least ~60 s of clean data, with a stable fixed-time window preferred for comparisons. Do not call a 10–120 s value interchangeable with a 5-min standard. |
+| **SDNN** | SDNN reflects all cyclic variability in the analyzed period and is therefore more duration-dependent than RMSSD. The Task Force/consensus recommendation remains 5 min for short-term comparability. In Melo et al., RMSSD was consistently more reliable than SDNN in spontaneous breathing; SDNN agreement improved with paced breathing but short epochs still changed means. [Task Force 1996](https://doi.org/10.1161/01.CIR.93.5.1043), [Melo et al. 2018](https://doi.org/10.1111/anec.12565). | Treat SDNN from the rolling 240 beats as **descriptive only**. For a standards-comparable SDNN display, use a clean, stationary 5-min fixed-time segment. |
+| **LF, HF, and LF/HF** | The consensus guidance recommends 5 min for short-term recording and says 1 min is an absolute minimum for reliable HF when a shorter design is unavoidable. Its rationale is at least 10 cycles of the lowest frequency being analyzed. Melo et al. found LF, HF, and LF:HF were poorly correlated with the 6-min reference across 1–3 min epochs, in both spontaneous and paced breathing. [Laborde et al. 2017](https://doi.org/10.3389/fpsyg.2017.00213), [Melo et al. 2018](https://doi.org/10.1111/anec.12565). | Do not present LF/HF or LF/HF-derived labels as stable before 5 min. At 0.04 Hz, ten cycles already require about 250 s; 5 min gives margin and remains the interoperable standard. |
+| **VLF** | The Task Force band starts at 0.0033 Hz (period about 300 s); short-term recordings cannot estimate it adequately. [Task Force 1996](https://doi.org/10.1161/01.CIR.93.5.1043). | Keep VLF out of short-session interpretation; if computed, label it unreliable below 5 min. |
+| **Spectral “coherence”** | Scientific cross-spectral/wavelet coherence quantifies time-frequency coupling between **two signals**, such as heart rate and respiration. Keissar, Davrath & Akselrod present wavelet-transform coherence specifically as a heart–respiration analysis and discuss thresholds for its estimates; it is not a single-series peak-prominence statistic. [Keissar et al. 2009](https://doi.org/10.1098/rsta.2008.0273). | The current `peak_concentration` is a transparent **single-series LF peak-concentration heuristic**, not standard cross-spectral coherence. It should not be called a coherence measurement unless a synchronized respiratory signal is added and a two-signal coherence method is implemented. |
+
+### Fixed-time versus beat-count windows
+
+For the same person at changing HR, a 240-beat window changes duration and therefore
+changes frequency resolution, number of respiratory/baroreflex cycles, and the amount of
+slow variability included. A fixed-time window gives comparable frequency resolution and
+band coverage across sessions and participants. A beat-count window is defensible for a
+responsive biofeedback display, but it is not the usual basis for comparing LF/HF, SDNN,
+or spectral peak values between sessions.
+
+### Rolling-window recommendation
+
+**Evidence:** Laborde et al. describe 5-min moving windows (for example, updated every
+minute) as a possible way to analyze long recordings, but advise strict 5-min epochs
+because moving averages create interpretive difficulties. This is guidance, not a
+validation of this app's exact update cadence.
+
+**Recommendation:** Keep the rolling display for responsiveness, but:
+
+1. Prefer a **fixed 5-min time window** for the primary LF/HF, SDNN, and resonance
+   estimate; use a 1-min update cadence (or slower) and label values as rolling.
+2. Permit a shorter 60–120 s RMSSD-only readout for immediate feedback, explicitly
+   marked ultra-short/descriptive.
+3. Do not infer a state or compare sessions until the relevant fixed-time window is
+   complete, stationary, and artifact-qualified.
+4. For research/export comparisons, report the window duration, update/overlap policy,
+   clean-beat count, artifact handling, breathing rate, and whether the estimate is
+   fixed or rolling.
+## 8. Determining an individual's resonance frequency (non-HeartMath protocol)
+
+### What is actually established
+
+The strongest practical, non-commercial protocol is the **Lehrer/Vaschillo resonance-frequency
+assessment**, operationalized in the peer-reviewed protocol paper by Lehrer et al. (2013) and
+described with its limitations by Shaffer & Meehan (2020). It is a physiological assessment
+protocol, not a diagnostic test and not a universally validated gold standard. The underlying
+primary evidence is narrower: Vaschillo et al. (2002) trained five healthy men at seven
+frequencies from 0.01–0.14 Hz and found high-amplitude, frequency-dependent heart-rate and
+blood-pressure oscillations with individual differences in the peak; this supports an
+individual resonance phenomenon, but does not validate the later five-trial scan. Lehrer et
+al. (2003) studied 54 healthy adults over 10 biofeedback sessions and found acute increases
+in LF HRV and vagal baroreflex gain during slow breathing; that study supports the mechanism
+and training response, not the reliability or diagnostic accuracy of a two-minute scan.
+
+### Exact Lehrer-style assessment
+
+1. **Prepare the participant.** Seat the participant comfortably and explain that the goal is
+   to find the breathing rate that produces the largest, smoothest heart-rate oscillation.
+   Let the participant practice relaxed breathing around 5.5–6.0 breaths/min first. Breaths
+   should be effortless and not excessively deep; use the same inhale/exhale timing at every
+   rate (the protocol commonly uses a somewhat longer exhalation). Do not proceed while the
+   participant is struggling, dizzy, or overbreathing.
+2. **Measure both signals.** Record ECG R–R intervals (preferred) or a validated PPG, **and a
+   synchronized respiratory waveform**, normally with a thoracic/abdominal respirometer.
+   Display both in real time. The respiratory channel is required to verify that the person
+   actually achieved the target rate, to detect breath-holding/overbreathing, and to calculate
+   heart-rate/respiration phase. PPG can be acceptable with good perfusion, but pulse transit
+   delay and vasoconstriction make ECG preferable during slow breathing.
+3. **Run five separate trials.** Record approximately **2 min at each target**, in the
+   standardized descending order **6.5, 6.0, 5.5, 5.0, and 4.5 breaths/min** (0.5-breath/min
+   steps), with approximately **2 min of rest between trials**. Save each trial as its own
+   epoch, rather than pooling rates. Confirm the achieved rate from the respiration signal;
+   repeat a trial when the average rate is about 0.25 breaths/min or more from target. Inspect
+   ECG/PPG and respiration for artifacts and repeat a contaminated epoch after another rest.
+4. **Extend the scan at an edge.** If the apparent peak is at 4.5 or 6.5 breaths/min, add
+   trials 0.5 breaths/min beyond that edge (and continue outward until the response falls).
+   The adult range is a heuristic operating range, not proof that every adult's peak lies
+   inside it; children use a different range in the source protocol.
+5. **Select by convergence, not one magic number.** For each clean epoch, compare the following
+   criteria, in the source protocol's stated priority order:
+   (a) heart-rate/respiration phase synchrony (near 0° in its convention), (b) mean
+   **HR Max − HR Min** across respiratory cycles (RSA amplitude), (c) absolute and normalized
+   LF power (0.04–0.15 Hz), (d) the highest-amplitude LF spectral peak, (e) smoothness of the
+   heart-rate waveform, and (f) the fewest distinct LF peaks. Pick the rate with the best
+   overall convergence. The published weights are expert priorities; **they have not been
+   experimentally validated**, and adjacent rates often win different criteria. RMSSD may be
+   reported as a supplementary vagal index, but it is not a substitute for confirming actual
+   respiration or phase.
+6. **Confirm the candidate.** During the first training/confirmation session, record **3–5 min**
+   at the candidate and at candidate ±0.5 breaths/min. Recheck comfort, achieved respiration
+   rate, artifacts, and the same selection criteria. Resolve a tie using comfort and the
+   intervention goal, and document the tie rather than presenting the result as exact.
+
+### Order, randomization, stabilization, and baroreflex gain
+
+The Lehrer-style procedure specifies a fixed descending order; it does **not** specify
+randomized or counterbalanced trial order. Therefore its result can be affected by practice,
+fatigue, habituation, time drift, and carry-over from the preceding rate. A study seeking an
+unbiased experimental comparison should preregister and counterbalance/randomize the five
+rates, keep rest and posture constant, and use the same artifact and stopping rules. That is
+an improvement for causal comparison, not evidence that randomization is part of the
+validated Lehrer protocol. Whichever order is used, stabilization means a comfortable
+stationary posture, a short practice period, verified target breathing, and a rest interval;
+it does not mean that two minutes has been proven sufficient for every endpoint.
+
+The protocol's primary selection signal is **HR oscillation amplitude**, not a directly measured
+baroreflex-gain score. A true baroreflex gain estimate requires beat-to-beat blood pressure
+alongside R–R intervals and an explicitly reported method (for example, a validated
+sequence or spectral/transfer-function analysis; Parati et al. 2000). Vaschillo et al. (2002)
+used transfer functions among respiration, heart rate, and blood pressure to characterize
+resonance. An HR-only or PPG-IBI-only app can therefore use RSA amplitude and LF peak
+alignment as proxies, but must not label them “baroreflex gain.”
+
+### Reliability and limitations
+
+- The two-minute trial length is conventional, not a demonstrated universal minimum. In 38
+  healthy undergraduates, Shaffer et al. (2019) found about 90 s adequate for LF power but
+  about 180 s needed for normalized LF power against a 5-min reference; no peer-reviewed
+  study had established concurrent validity for the key phase-synchrony and HR Max − HR Min
+  criteria when Shaffer & Meehan (2020) reviewed the evidence.
+- Test–retest evidence is sparse. Fuller et al. (2011) reported a two-week correlation of
+  *r* = 0.73 (*d* = 2.14) in only 21 undergraduates (conference report summarized by Shaffer
+  & Meehan); replication in larger and more representative samples was explicitly requested.
+  Treat the result as a session estimate, not a permanent trait.
+- The apparent peak depends on posture, time of day, training/learning, breathing depth and
+  inhale/exhale ratio, CO₂ loss from overbreathing, medications, vascular state, age/body
+  size, and signal quality. A visually large LF peak can also reflect failure to follow the
+  target or an artifact. Slow breathing near 6 breaths/min often produces large RSA even
+  without individual scanning, and evidence that individualized resonance training improves
+  clinical outcomes more than generic 6-breaths/min training remains preliminary.
+- Pacemakers, clinically important rhythm abnormalities, and conditions in which slow
+  breathing could worsen acidosis require clinical screening; this is not a self-administered
+  diagnostic maneuver.
+
+### Practical recommendation for `training/`
+
+The app has a PPG-derived IBI stream and an explicit multi-rate finder, but no synchronized
+respiration channel and no direct blood-pressure measurement. Its LF peak/concentration and
+target-frequency score are consequently transparent single-series heuristics, **not personal
+resonance-frequency determination and not baroreflex-gain measurement**. Report the window,
+clean-beat count, artifacts, receipt-time coverage, and paced rate.
+
+The current finder implements the cardiac-only subset: five paced rates, two-minute trials,
+two-minute rests, artifact filtering, and target-frequency scoring. It must remain labeled
+as a candidate cardiac response. A validated resonance assessment would additionally need
+a respiratory belt, verified actual rate, phase synchrony, artifact repeats, multi-criterion
+selection, and 3–5-minute confirmation at ±0.5 bpm.
+
+**Primary/methodological sources:** [Vaschillo et al. 2002](https://doi.org/10.1023/A:1014587304314);
+[Lehrer et al. 2003](https://doi.org/10.1097/01.PSY.0000089200.81962.19);
+[Lehrer et al. 2013](https://doi.org/10.5298/1081-5937-41.3.08);
+[Shaffer & Meehan 2020](https://doi.org/10.3389/fnins.2020.570400);
+[Parati et al. 2000](https://pubmed.ncbi.nlm.nih.gov/10678538/).
+
+## 9. Artifact correction
+
+Only records whose flag is not `T` enter the NN series. `T` beats advance the
+physiological time axis (their IBI duration is added) but are excluded from all metrics
+and counted as artifacts. This mirrors the standard "remove ectopic/artifactual beats,
+preserve timing" guidance (Task Force 1996; Shaffer & Meehan 2020 §Resonance Frequency
+Trials).

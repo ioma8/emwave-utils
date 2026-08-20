@@ -1,22 +1,28 @@
 #![cfg_attr(target_os = "android", no_main)]
-//! emWave2 resonance trainer: 6 bpm breath pacer + live HR/HRV/resonance.
+//! emWave2 resonance trainer: paced breathing + live HR/HRV/resonance.
 //!
 //! Reader thread talks HID and publishes a snapshot; the egui thread renders.
 
+mod analysis;
+mod archive;
 mod emwave;
 mod metrics;
+mod protocol;
+mod runtime;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use archive::{ArchiveStore, SessionBuilder};
 use eframe::egui;
+use analysis::NnSeries;
 use metrics::{HrvMetrics, Resonance};
-
+use runtime::{FinderRuntime, FINDER_RATES, MIN_TRIAL_DATA_SECONDS, REST_SECONDS, TRIAL_SECONDS};
 const WINDOW_BEATS: usize = 240;
-const CYCLE_SEC: f64 = 10.0; // 6 bpm
-const INHALE_SEC: f64 = 4.0;
+const GRAPH_BEATS: usize = 120;
+const DEFAULT_PACER_RATE: f64 = 6.0;
+const INHALE_FRACTION: f64 = 0.4;
 
 #[derive(Clone, Default)]
 struct Snapshot {
@@ -27,9 +33,14 @@ struct Snapshot {
     beats: usize,
     artifacts: usize,
     elapsed: f64,
+    mean_hr: f64,
+    mean_score: f64,
+    session_started_unix: i64,
     hrv: Option<HrvMetrics>,
     res: Option<Resonance>,
+    analysis_received: NnSeries,
     series: Vec<f64>,
+    sessions: Vec<archive::SessionRecord>,
 }
 
 // --------------------------------------------------------------------------
@@ -42,13 +53,12 @@ struct Beat {
     hr: f64,
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
 
 /// Parse one `<2 I=NNN R=F H=NN >` record line.
 fn parse_ibi(line: &[u8]) -> Option<Beat> {
-    let i = find(line, b"<2 I=")? + 5;
+    let i = line
+        .windows(b"<2 I=".len())
+        .position(|window| window == b"<2 I=")? + 5;
     let mut j = i;
     let mut ibi = 0.0;
     while j < line.len() && line[j].is_ascii_digit() {
@@ -58,12 +68,17 @@ fn parse_ibi(line: &[u8]) -> Option<Beat> {
     if ibi <= 0.0 {
         return None;
     }
-    let artifact = find(line, b"R=")
+    let artifact = line
+        .windows(2)
+        .position(|window| window == b"R=")
         .and_then(|r| line.get(r + 2))
         .map(|&b| b == b'T')
         .unwrap_or(false);
     let mut hr = 0.0;
-    if let Some(h) = find(line, b"H=") {
+    if let Some(h) = line
+        .windows(2)
+        .position(|window| window == b"H=")
+    {
         let mut k = h + 2;
         while k < line.len() && line[k].is_ascii_digit() {
             hr = hr * 10.0 + (line[k] - b'0') as f64;
@@ -93,49 +108,71 @@ impl BeatParser {
             }
         }
         None
-    }
+}
 }
 
 struct HeartStream {
-    ibis: Vec<(f64, f64)>, // (beat_time_s, ibi_ms) artifact-free
+    ibis: NnSeries,
+    analysis_received: NnSeries,
     raw: Vec<f64>,
     last_hr: f64,
     last_ibi: f64,
     artifacts: usize,
     beat_time: f64,
     started: Instant,
+    started_unix: i64,
+    hr_sum: f64,
+    hr_count: usize,
+    score_sum: f64,
+    score_count: usize,
+    sessions: Vec<archive::SessionRecord>,
 }
 
 impl HeartStream {
-    fn new() -> Self {
+    fn new(sessions: Vec<archive::SessionRecord>) -> Self {
         HeartStream {
-            ibis: Vec::new(),
+            ibis: NnSeries::new(),
+            analysis_received: NnSeries::new(),
             raw: Vec::new(),
             last_hr: 0.0,
             last_ibi: 0.0,
             artifacts: 0,
             beat_time: 0.0,
             started: Instant::now(),
+            started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default(),
+            hr_sum: 0.0,
+            hr_count: 0,
+            score_sum: 0.0,
+            score_count: 0,
+            sessions,
         }
     }
 
     fn ingest(&mut self, b: Beat) {
         self.last_ibi = b.ibi_ms;
-        if b.hr > 0.0 {
-            self.last_hr = b.hr;
+        if !b.artifact && b.ibi_ms > 0.0 {
+            let derived_hr = 60_000.0 / b.ibi_ms;
+            self.last_hr = derived_hr;
+            self.hr_sum += derived_hr;
+            self.hr_count += 1;
         }
         self.beat_time += b.ibi_ms / 1000.0;
         if b.artifact {
             self.artifacts += 1;
         } else {
-            self.ibis.push((self.beat_time, b.ibi_ms));
-            if self.ibis.len() > WINDOW_BEATS {
-                self.ibis.drain(..self.ibis.len() - WINDOW_BEATS);
+            self.ibis.push(self.beat_time, b.ibi_ms);
+            self.ibis.trim_to(WINDOW_BEATS);
+            if let Some(res) = metrics::resonance(&self.ibis) {
+                self.score_sum += res.score;
+                self.score_count += 1;
             }
         }
         self.raw.push(b.ibi_ms);
-        if self.raw.len() > WINDOW_BEATS {
-            self.raw.drain(..self.raw.len() - WINDOW_BEATS);
+        if self.raw.len() > GRAPH_BEATS {
+            self.raw.drain(..self.raw.len() - GRAPH_BEATS);
         }
     }
 
@@ -148,9 +185,22 @@ impl HeartStream {
             beats: self.ibis.len(),
             artifacts: self.artifacts,
             elapsed: self.started.elapsed().as_secs_f64(),
+            mean_hr: if self.hr_count > 0 {
+                self.hr_sum / self.hr_count as f64
+            } else {
+                0.0
+            },
+            mean_score: if self.score_count > 0 {
+                self.score_sum / self.score_count as f64
+            } else {
+                0.0
+            },
+            session_started_unix: self.started_unix,
             hrv: metrics::hrv_metrics(&self.ibis),
             res: metrics::resonance(&self.ibis),
+            analysis_received: self.analysis_received.clone(),
             series: self.raw.clone(),
+            sessions: self.sessions.clone(),
         }
     }
 }
@@ -166,6 +216,21 @@ fn diagnostics_path() -> &'static str {
     {
         "/tmp/emwave-resonance.log"
     }
+}
+
+fn persist_snapshot(snap: &mut Snapshot, samples: &[archive::BeatRecord]) {
+    if snap.beats == 0 || snap.session_started_unix <= 0 {
+        return;
+    }
+    let record = SessionBuilder::from_samples(samples).finish(
+        snap.session_started_unix,
+        snap.elapsed,
+        snap.mean_hr,
+        snap.mean_score,
+        snap.beats,
+        snap.artifacts,
+    );
+    snap.sessions = ArchiveStore::append(snap.sessions.clone(), record);
 }
 
 fn diagnostic(message: impl AsRef<str>) {
@@ -185,31 +250,53 @@ fn diagnostic(message: impl AsRef<str>) {
 // --------------------------------------------------------------------------
 
 #[allow(unused_mut)]
-fn reader_loop(shared: Arc<Mutex<Snapshot>>, platform: emwave::AndroidContext) {
+fn reader_loop(
+    shared: Arc<Mutex<Snapshot>>,
+    session_samples: Arc<Mutex<Vec<archive::BeatRecord>>>,
+    platform: emwave::AndroidContext,
+) {
     diagnostic("reader thread started");
     loop {
         diagnostic("opening emWave2");
         match emwave::Device::open_and_start(platform) {
             Ok(mut dev) => {
-                diagnostic("emWave2 opened and session started");
-                let mut stream = HeartStream::new();
+                let mut stream = HeartStream::new(ArchiveStore::load());
+                let reader_started = Instant::now();
+                session_samples.lock().unwrap().clear();
                 let mut parser = BeatParser::new();
-                *shared.lock() = stream.snapshot("connected", true);
+                *shared.lock().unwrap() = stream.snapshot("connected", true);
                 loop {
                     match dev.read_report(150) {
                         Ok(Some(rep)) => {
                             if rep[0] == 0x75 {
                                 parser.feed(&rep[4..4 + rep[3] as usize]);
                                 while let Some(b) = parser.next() {
+                                    let received_secs = reader_started.elapsed().as_secs_f64();
+                                    let sample = (b.ibi_ms, b.artifact, b.hr);
                                     stream.ingest(b);
+                                    if !sample.1 {
+                                        stream.analysis_received.push(received_secs, sample.0);
+                                        stream.analysis_received.trim_to(WINDOW_BEATS);
+                                        }
+                                    session_samples.lock().unwrap().push(archive::BeatRecord {
+                                        time_secs: stream.beat_time,
+                                        received_secs,
+                                        ibi_ms: sample.0,
+                                        artifact: sample.1,
+                                        hr: sample.2,
+                                    });
                                 }
-                                *shared.lock() = stream.snapshot("connected", true);
+                                *shared.lock().unwrap() = stream.snapshot("connected", true);
                             }
                         }
                         Ok(None) => {}
                         Err(e) => {
                             diagnostic(format!("HID read error: {e}"));
-                            *shared.lock() = stream.snapshot(&format!("read error: {e}"), false);
+                            let mut snap =
+                                stream.snapshot(&format!("read error: {e}"), false);
+                            let samples = session_samples.lock().unwrap().clone();
+                            persist_snapshot(&mut snap, &samples);
+                            *shared.lock().unwrap() = snap;
                             break;
                         }
                     }
@@ -217,9 +304,10 @@ fn reader_loop(shared: Arc<Mutex<Snapshot>>, platform: emwave::AndroidContext) {
             }
             Err(e) => {
                 diagnostic(format!("USB/HID open error: {e}"));
-                let mut snap = Snapshot::default();
+                let mut snap = shared.lock().unwrap().clone();
+                snap.connected = false;
                 snap.status = e;
-                *shared.lock() = snap;
+                *shared.lock().unwrap() = snap;
             }
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -244,29 +332,47 @@ const RED: egui::Color32 = egui::Color32::from_rgb(242, 107, 102);
 
 struct App {
     shared: Arc<Mutex<Snapshot>>,
+    session_samples: Arc<Mutex<Vec<archive::BeatRecord>>>,
     started: Instant,
     pacer_enabled: bool,
+    pacer_rate: f64,
+    view: View,
+    finder: FinderRuntime,
+    selected_session: Option<usize>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, shared: Arc<Mutex<Snapshot>>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        shared: Arc<Mutex<Snapshot>>,
+        session_samples: Arc<Mutex<Vec<archive::BeatRecord>>>,
+    ) -> Self {
         configure_style(&cc.egui_ctx);
+        shared.lock().unwrap().sessions = ArchiveStore::load();
         Self {
             shared,
+            session_samples,
             started: Instant::now(),
             pacer_enabled: true,
+            pacer_rate: DEFAULT_PACER_RATE,
+            view: View::Train,
+            finder: FinderRuntime::default(),
+            selected_session: None,
         }
     }
 
     fn pacer(&self) -> (&'static str, f64, f64) {
-        let pos = self.started.elapsed().as_secs_f64() % CYCLE_SEC;
-        if pos < INHALE_SEC {
-            ("INHALE", pos / INHALE_SEC, pos / INHALE_SEC)
+        let cycle = 60.0 / self.pacer_rate.max(1.0);
+        let inhale = cycle * INHALE_FRACTION;
+        let pos = self.started.elapsed().as_secs_f64() % cycle;
+        if pos < inhale {
+            ("INHALE", pos / inhale, pos / inhale)
         } else {
-            let progress = (pos - INHALE_SEC) / (CYCLE_SEC - INHALE_SEC);
+            let progress = (pos - inhale) / (cycle - inhale);
             ("EXHALE", progress, 1.0 - progress)
         }
     }
+
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -294,6 +400,13 @@ fn configure_style(ctx: &egui::Context) {
         .text_styles
         .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Train,
+    Finder,
+    Sessions,
 }
 
 fn card() -> egui::Frame {
@@ -443,7 +556,7 @@ fn mobile_dashboard(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
         painter.text(
             center + egui::vec2(0.0, 16.0),
             egui::Align2::CENTER_CENTER,
-            "6.0 breaths / min",
+            format!("{:.1} breaths / min", app.pacer_rate),
             egui::FontId::proportional(11.0),
             TEXT,
         );
@@ -453,9 +566,9 @@ fn mobile_dashboard(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
                 .corner_radius(8)
                 .fill(tint)
                 .text(if app.pacer_enabled {
-                    "4 sec in  ·  6 sec out"
+                    format!("{:.1} breaths / min", app.pacer_rate)
                 } else {
-                    "Pacer disabled"
+                    "Pacer disabled".to_owned()
                 }),
         );
     });
@@ -582,14 +695,695 @@ fn mobile_dashboard(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
 }
 
 
+fn finder_pacer(ui: &mut egui::Ui, app: &App) {
+    if app.finder.resting {
+        let elapsed = app
+            .finder
+            .rest_started
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+            .min(REST_SECONDS);
+        card().show(ui, |ui| {
+            section_label(ui, "REST BETWEEN TRIALS");
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Breathe naturally; do not follow the pacer.")
+                    .size(16.0)
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("{:.0}s remaining", REST_SECONDS - elapsed))
+                    .size(28.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.add(
+                egui::ProgressBar::new((elapsed / REST_SECONDS) as f32)
+                    .desired_width(ui.available_width())
+                    .fill(MUTED)
+                    .text(format!("next: {:.1} breaths/min", app.pacer_rate)),
+            );
+        });
+        return;
+    }
+    let (phase, progress, amount) = app.pacer();
+    let tint = if phase == "INHALE" { ACCENT } else { BLUE };
+    card().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            section_label(ui, "BREATH PACER");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                pill(
+                    ui,
+                    &format!("{:.1} breaths/min", app.pacer_rate),
+                    tint,
+                );
+            });
+        });
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::hover());
+        let center = rect.center();
+        let radius = 34.0 + 38.0 * amount as f32;
+        let painter = ui.painter_at(rect);
+        painter.circle_filled(center, 76.0, CHART_BG);
+        painter.circle_stroke(center, 76.0, egui::Stroke::new(1.0, BORDER));
+        painter.circle_filled(
+            center,
+            radius,
+            egui::Color32::from_rgba_premultiplied(tint.r(), tint.g(), tint.b(), 52),
+        );
+        painter.circle_stroke(center, radius, egui::Stroke::new(3.0, tint));
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            phase,
+            egui::FontId::proportional(19.0),
+            TEXT,
+        );
+        ui.add(
+            egui::ProgressBar::new(progress as f32)
+                .desired_width(ui.available_width())
+                .fill(tint)
+                .text("follow the circle gently"),
+        );
+    });
+}
+
+fn resonance_finder(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
+    let current_rate = FINDER_RATES[app.finder.rate_index];
+    let resting = app.finder.resting;
+    let period = if resting { REST_SECONDS } else { TRIAL_SECONDS };
+    let elapsed = if resting {
+        app.finder
+            .rest_started
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    } else {
+        app.finder
+            .started
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+    .min(period);
+
+    card().show(ui, |ui| {
+        section_label(ui, "PERSONAL RESONANT RATE");
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Run five two-minute trials from 6.5 down to 4.5 breaths/min, with two-minute natural-breathing rests. This is a cardiac PPG heuristic; respiration is not measured.",
+            )
+            .size(14.0)
+            .color(TEXT),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "This is an indicative screen, not a clinical measurement. Stay seated, relaxed, and keep the ear clip still.",
+            )
+            .size(12.0)
+            .color(MUTED),
+        );
+    });
+
+    ui.add_space(10.0);
+    finder_pacer(ui, app);
+    ui.add_space(10.0);
+    if app.finder.active {
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                section_label(
+                    ui,
+                    if resting {
+                        "REST BETWEEN TRIALS"
+                    } else if app.finder.run_all {
+                        "SEQUENTIAL TRIALS"
+                    } else {
+                        "TRIAL IN PROGRESS"
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pill(
+                        ui,
+                        &format!("{current_rate:.1} breaths/min"),
+                        ACCENT,
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("{:.0}s remaining", period - elapsed))
+                    .size(28.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            if app.finder.run_all {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Trial {} of {}",
+                        app.finder.rate_index + 1,
+                        FINDER_RATES.len()
+                    ))
+                    .size(13.0)
+                    .color(MUTED),
+                );
+            }
+            ui.add(
+                egui::ProgressBar::new((elapsed / period) as f32)
+                    .desired_width(ui.available_width())
+                    .fill(if resting { MUTED } else { ACCENT })
+                    .text(if resting {
+                        "breathe naturally"
+                    } else {
+                        "breathe with the circle"
+                    }),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(if snap.connected {
+                    "Collecting clean heart beats…"
+                } else {
+                    "Device disconnected — reconnect before continuing"
+                })
+                .size(12.0)
+                .color(if snap.connected { MUTED } else { RED }),
+            );
+        });
+    } else {
+        card().show(ui, |ui| {
+            section_label(ui, "FIND YOUR RATE");
+            if app.finder.interrupted {
+                ui.label(
+                    egui::RichText::new(
+                        "Previous run interrupted by USB disconnect; incomplete trial was not scored.",
+                    )
+                    .size(12.0)
+                    .color(RED),
+                );
+                ui.add_space(6.0);
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    snap.connected,
+                    egui::Button::new("RUN 5 TRIALS · ABOUT 18 MINUTES"),
+                )
+                .clicked()
+            {
+                app.finder.results.clear();
+                app.finder.start_trial(0, true, snap);
+            }
+            ui.label(
+                egui::RichText::new(if snap.connected {
+                    "Runs 6.5, 6.0, 5.5, 5.0, and 4.5 breaths/min with rests."
+                } else {
+                    "Connect the emWave2 before starting."
+                })
+                .size(12.0)
+                .color(if snap.connected { MUTED } else { RED }),
+            );
+            ui.add_space(12.0);
+            section_label(ui, "OR RUN ONE TRIAL");
+            ui.horizontal_wrapped(|ui| {
+                for (index, &rate) in FINDER_RATES.iter().enumerate() {
+                    let completed = app.finder.results.iter().any(|r| (r.rate - rate).abs() < 0.01);
+                    let label = if completed {
+                        format!("✓ {rate:.1}")
+                    } else {
+                        format!("{rate:.1}")
+                    };
+                    if ui
+                        .add_enabled(snap.connected, egui::Button::new(label))
+                        .clicked()
+                    {
+                        app.finder.start_trial(index, false, snap);
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("Each trial lasts 2 minutes; rests last 2 minutes.")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        });
+    }
+
+    if !app.finder.results.is_empty() {
+        ui.add_space(10.0);
+        card().show(ui, |ui| {
+            section_label(ui, "TARGET-FREQUENCY RESULTS");
+            ui.add_space(6.0);
+            let mut ranked = app.finder.results.clone();
+            ranked.sort_by(|a, b| {
+                let a_reliable = a.alignment.is_some_and(|value| {
+                    value.reliable && value.span_s >= MIN_TRIAL_DATA_SECONDS
+                });
+                let b_reliable = b.alignment.is_some_and(|value| {
+                    value.reliable && value.span_s >= MIN_TRIAL_DATA_SECONDS
+                });
+                b_reliable.cmp(&a_reliable).then_with(|| {
+                    let a_score = a.alignment.map(|value| value.score).unwrap_or(-1.0);
+                    let b_score = b.alignment.map(|value| value.score).unwrap_or(-1.0);
+                    b_score.partial_cmp(&a_score).unwrap()
+                })
+            });
+            let best_rate = ranked
+                .iter()
+                .find(|result| {
+                    result
+                        .alignment
+                        .is_some_and(|value| value.reliable && value.span_s >= MIN_TRIAL_DATA_SECONDS)
+                })
+                .map(|result| result.rate);
+            for result in ranked {
+                let (status, tint, detail) = match result.alignment {
+                    Some(value) if value.span_s < MIN_TRIAL_DATA_SECONDS => (
+                        "PARTIAL",
+                        AMBER,
+                        format!(
+                            "score {:.0} · peak {:.1} · Δ{:.1} · target {:.0}% LF {:.0}% · n {:.0}s",
+                            value.score,
+                            value.peak_bpm,
+                            value.mismatch_bpm,
+                            value.target_peak_ratio * 100.0,
+                            value.lf_nu,
+                            value.span_s
+                        ),
+                    ),
+                    Some(value) if Some(result.rate) == best_rate => (
+                        "BEST CANDIDATE",
+                        ACCENT,
+                        format!(
+                            "score {:.0} · peak {:.1} · Δ{:.1} · target {:.0}% LF {:.0}% · n {:.0}s",
+                            value.score,
+                            value.peak_bpm,
+                            value.mismatch_bpm,
+                            value.target_peak_ratio * 100.0,
+                            value.lf_nu,
+                            value.span_s
+                        ),
+                    ),
+                    Some(value) if value.reliable => (
+                        "CANDIDATE",
+                        BLUE,
+                        format!(
+                            "score {:.0} · peak {:.1} · Δ{:.1} · target {:.0}% LF {:.0}% · n {:.0}s",
+                            value.score,
+                            value.peak_bpm,
+                            value.mismatch_bpm,
+                            value.target_peak_ratio * 100.0,
+                            value.lf_nu,
+                            value.span_s
+                        ),
+                    ),
+                    Some(value) => (
+                        "NO MATCH",
+                        AMBER,
+                        format!(
+                            "score {:.0} · peak {:.1} · Δ{:.1} · target {:.0}% LF {:.0}% · n {:.0}s",
+                            value.score,
+                            value.peak_bpm,
+                            value.mismatch_bpm,
+                            value.target_peak_ratio * 100.0,
+                            value.lf_nu,
+                            value.span_s
+                        ),
+                    ),
+                    None => ("NO DATA", RED, "insufficient clean trial data".to_owned()),
+                };
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(10.0)
+                                .strong()
+                                .color(tint),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:.1} breaths/min", result.rate))
+                                .size(14.0)
+                                .color(TEXT),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(detail).size(11.0).color(MUTED));
+                    });
+                });
+                ui.add_space(4.0);
+            }
+            ui.label(
+                egui::RichText::new(match best_rate {
+                    Some(rate) => format!(
+                        "Best cardiac candidate: {rate:.1} breaths/min. Confirm it with respiration monitoring or a longer session."
+                    ),
+                    None => "No reliable cardiac candidate. Repeat with verified breathing and a stable sensor.".to_owned(),
+                })
+                .size(12.0)
+                .color(MUTED),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "A candidate requires a peak within 0.5 bpm of the paced rate and score ≥35; this is not phase-verified without respiration.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Score measures response at the tested rate; MATCH additionally requires the dominant LF peak to align.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+        });
+    }
+}
+
+fn session_graph(ui: &mut egui::Ui, session: &archive::SessionRecord) {
+    card().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            section_label(ui, "ARCHIVED HEART RHYTHM");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} samples", session.samples.len()))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            });
+        });
+        if session.samples.len() < 2 {
+            ui.label(
+                egui::RichText::new("This older session has no archived beat waveform.")
+                    .size(12.0)
+                    .color(AMBER),
+            );
+            return;
+        }
+        let (lo, hi) = session
+            .samples
+            .iter()
+            .map(|sample| sample.ibi_ms)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), ibi| {
+                (lo.min(ibi), hi.max(ibi))
+            });
+        let range = (hi - lo).max(100.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 220.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 11.0, CHART_BG);
+        let mut clean_points = Vec::new();
+        for (index, sample) in session.samples.iter().enumerate() {
+            let x = rect.left()
+                + 8.0
+                + index as f32 / (session.samples.len() - 1) as f32 * (rect.width() - 16.0);
+            let y = rect.bottom()
+                - 8.0
+                - ((sample.ibi_ms - lo) / range) as f32 * (rect.height() - 16.0);
+            if sample.artifact {
+                painter.circle_filled(egui::pos2(x, y), 3.5, RED);
+            } else {
+                clean_points.push(egui::pos2(x, y));
+            }
+        }
+        if clean_points.len() >= 2 {
+            painter.add(egui::Shape::line(
+                clean_points,
+                egui::Stroke::new(2.0, ACCENT),
+            ));
+        }
+        painter.text(
+            rect.left_top() + egui::vec2(10.0, 10.0),
+            egui::Align2::LEFT_TOP,
+            format!("{hi:.0} ms"),
+            egui::FontId::monospace(10.0),
+            MUTED,
+        );
+        painter.text(
+            rect.left_bottom() + egui::vec2(10.0, -10.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{lo:.0} ms"),
+            egui::FontId::monospace(10.0),
+            MUTED,
+        );
+        ui.label(
+            egui::RichText::new("Green: clean NN intervals · red: artifact-marked intervals")
+                .size(11.0)
+                .color(MUTED),
+        );
+    });
+}
+
+fn session_history(
+    ui: &mut egui::Ui,
+    sessions: &[archive::SessionRecord],
+    selected_session: &mut Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Previous sessions")
+                .size(24.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("{} recorded", sessions.len()))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        });
+    });
+    ui.add_space(12.0);
+
+    if sessions.is_empty() {
+        card().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("No sessions recorded yet")
+                    .size(17.0)
+                    .color(TEXT),
+            );
+            ui.label(
+                egui::RichText::new("Run a training session and it will appear here.")
+                    .size(13.0)
+                    .color(MUTED),
+            );
+        });
+        return;
+    }
+
+    for (index, session) in sessions.iter().enumerate() {
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("#{}", sessions.len() - index))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(archive::ArchiveStore::format_date(session.started_unix))
+                            .size(15.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} beats  ·  {} artifacts",
+                            session.beats, session.artifacts
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", session.mean_score))
+                                    .size(22.0)
+                                    .strong()
+                                    .color(state_color(if session.mean_score >= 75.0 {
+                                        "RESONANT"
+                                    } else {
+                                        "BALANCED"
+                                    })),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0} bpm  ·  {:.0}s",
+                                    session.mean_hr, session.duration_secs
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        });
+                    },
+                );
+            });
+            if ui
+                .button(if *selected_session == Some(index) {
+                    "VIEWING GRAPH"
+                } else if session.samples.is_empty() {
+                    "NO ARCHIVE"
+                } else {
+                    "VIEW GRAPH"
+                })
+                .clicked()
+                && !session.samples.is_empty()
+            {
+                *selected_session = Some(index);
+            }
+        });
+        ui.add_space(8.0);
+    }
+    if let Some(index) = *selected_session {
+        if let Some(session) = sessions.get(index) {
+            ui.add_space(8.0);
+            session_graph(ui, session);
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequential_finder_runs_every_rate_then_stops() {
+        let mut app = App {
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            session_samples: Arc::new(Mutex::new(Vec::new())),
+            started: Instant::now(),
+            pacer_enabled: true,
+            pacer_rate: DEFAULT_PACER_RATE,
+            view: View::Finder,
+            finder: FinderRuntime::default(),
+            selected_session: None,
+        };
+        let snap = Snapshot::default();
+
+        app.finder.start_trial(0, true, &snap);
+        for expected in 1..FINDER_RATES.len() {
+            app.finder.finish_trial(&snap, MIN_TRIAL_DATA_SECONDS);
+            assert!(app.finder.active);
+            assert_eq!(app.finder.rate_index, expected);
+        }
+        app.finder.finish_trial(&snap, MIN_TRIAL_DATA_SECONDS);
+
+        assert!(!app.finder.active);
+    }
+
+    #[test]
+    fn sequential_finder_inserts_natural_breathing_rest() {
+        let mut app = App {
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            session_samples: Arc::new(Mutex::new(Vec::new())),
+            started: Instant::now(),
+            pacer_enabled: true,
+            pacer_rate: DEFAULT_PACER_RATE,
+            view: View::Finder,
+            finder: FinderRuntime::default(),
+            selected_session: None,
+        };
+        let snap = Snapshot {
+            connected: true,
+            ..Default::default()
+        };
+        app.finder.start_trial(0, true, &snap);
+        app.finder.finish_trial(&snap, MIN_TRIAL_DATA_SECONDS);
+        assert!(app.finder.active);
+        assert!(app.finder.resting);
+        assert_eq!(app.finder.rate_index, 1);
+        app.finder.rest_started =
+            Some(Instant::now() - Duration::from_secs(REST_SECONDS as u64 + 1));
+        app.finder.update(&snap);
+        assert!(!app.finder.resting);
+        assert_eq!(app.finder.rate_index, 1);
+        assert!(app.finder.started.is_some());
+    }
+
+    #[test]
+    fn disconnect_interrupts_trial_without_scoring() {
+        let mut app = App {
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            session_samples: Arc::new(Mutex::new(Vec::new())),
+            started: Instant::now(),
+            pacer_enabled: true,
+            pacer_rate: DEFAULT_PACER_RATE,
+            view: View::Finder,
+            finder: FinderRuntime::default(),
+            selected_session: None,
+        };
+        let connected = Snapshot::default();
+        app.finder.start_trial(0, true, &connected);
+        let disconnected = Snapshot {
+            connected: false,
+            ..connected
+        };
+        app.finder.update(&disconnected);
+        assert!(!app.finder.active);
+        assert!(app.finder.interrupted);
+        assert!(app.finder.results.is_empty());
+    }
+
+    #[test]
+    fn finder_uses_receipt_time_for_trial_boundaries() {
+        let mut app = App {
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            session_samples: Arc::new(Mutex::new(Vec::new())),
+            started: Instant::now(),
+            pacer_enabled: true,
+            pacer_rate: DEFAULT_PACER_RATE,
+            view: View::Finder,
+            finder: FinderRuntime::default(),
+            selected_session: None,
+        };
+        let snap = Snapshot {
+            analysis_received: NnSeries::from_vec(vec![(12.5, 800.0)]),
+            ..Default::default()
+        };
+        app.finder.start_trial(0, false, &snap);
+        assert_eq!(app.finder.data_started_s, Some(12.5));
+    }
+
+    #[test]
+    fn artifact_heart_rate_does_not_change_session_mean() {
+        let mut stream = HeartStream::new(Vec::new());
+        stream.ingest(Beat {
+            ibi_ms: 1000.0,
+            artifact: false,
+            hr: 120.0,
+        });
+        stream.ingest(Beat {
+            ibi_ms: 1000.0,
+            artifact: true,
+            hr: 120.0,
+        });
+        stream.ingest(Beat {
+            ibi_ms: 1000.0,
+            artifact: false,
+            hr: 60.0,
+        });
+        assert_eq!(stream.snapshot("test", true).mean_hr, 60.0);
+    }
+}
+impl Drop for App {
+    fn drop(&mut self) {
+        let mut snap = self.shared.lock().unwrap().clone();
+        let samples = self.session_samples.lock().unwrap().clone();
+        persist_snapshot(&mut snap, &samples);
+        *self.shared.lock().unwrap() = snap;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let snap = self.shared.lock().clone();
-        let state = snap.res.map(|r| r.state).unwrap_or("BUILDING");
-        let state_tint = state_color(state);
+        let snap = self.shared.lock().unwrap().clone();
+        self.finder.update(&snap);
 
         egui::CentralPanel::default()
             .frame(
+
                 egui::Frame::new()
                     .fill(BG)
                     .inner_margin(egui::Margin::symmetric(20, 16)),
@@ -630,332 +1424,34 @@ impl eframe::App for App {
                                 },
                             );
                         });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(self.view == View::Train, "TRAIN")
+                                .clicked()
+                            {
+                                self.view = View::Train;
+                            }
+                            if ui
+                                .selectable_label(self.view == View::Sessions, "SESSIONS")
+                                .clicked()
+                            {
+                                self.view = View::Sessions;
+                            }
+                            if ui
+                                .selectable_label(self.view == View::Finder, "FIND RATE")
+                                .clicked()
+                            {
+                                self.view = View::Finder;
+                            }
+                        });
 
-                        let mobile = ui.available_width() < 760.0;
-                        if mobile {
-                            mobile_dashboard(ui, &snap, self);
+                        if self.view == View::Sessions {
+                            session_history(ui, &snap.sessions, &mut self.selected_session);
+                        } else if self.view == View::Finder {
+                            resonance_finder(ui, &snap, self);
                         } else {
-                        ui.add_space(14.0);
-
-                        ui.columns(2, |cols| {
-                            card().show(&mut cols[0], |ui| {
-                                ui.set_min_height(210.0);
-                                ui.horizontal(|ui| {
-                                    section_label(ui, "BREATH PACER");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .checkbox(&mut self.pacer_enabled, "Enabled")
-                                                .changed()
-                                                && self.pacer_enabled
-                                            {
-                                                self.started = Instant::now();
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.label(
-                                    egui::RichText::new(if self.pacer_enabled {
-                                        "Follow the circle gently"
-                                    } else {
-                                        "Pacer paused · measurements continue"
-                                    })
-                                    .size(14.0)
-                                    .color(MUTED),
-                                );
-
-                                let (phase, progress, breath_amount) = if self.pacer_enabled {
-                                    self.pacer()
-                                } else {
-                                    ("PAUSED", 0.0, 0.0)
-                                };
-                                let phase_tint = if !self.pacer_enabled {
-                                    MUTED
-                                } else if phase == "INHALE" {
-                                    ACCENT
-                                } else {
-                                    BLUE
-                                };
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 150.0),
-                                    egui::Sense::hover(),
-                                );
-                                let center = rect.center();
-                                let painter = ui.painter();
-                                painter.circle_filled(
-                                    center,
-                                    72.0,
-                                    egui::Color32::from_rgb(12, 19, 26),
-                                );
-                                painter.circle_stroke(
-                                    center,
-                                    72.0,
-                                    egui::Stroke::new(1.0, BORDER),
-                                );
-                                let radius = 32.0 + 34.0 * breath_amount as f32;
-                                painter.circle_filled(
-                                    center,
-                                    radius,
-                                    egui::Color32::from_rgba_premultiplied(
-                                        phase_tint.r(),
-                                        phase_tint.g(),
-                                        phase_tint.b(),
-                                        52,
-                                    ),
-                                );
-                                painter.circle_stroke(
-                                    center,
-                                    radius,
-                                    egui::Stroke::new(3.0, phase_tint),
-                                );
-                                painter.text(
-                                    center - egui::vec2(0.0, 7.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    phase,
-                                    egui::FontId::proportional(19.0),
-                                    TEXT,
-                                );
-                                painter.text(
-                                    center + egui::vec2(0.0, 17.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    if self.pacer_enabled {
-                                        "6.0 breaths / min"
-                                    } else {
-                                        "live metrics remain active"
-                                    },
-                                    egui::FontId::proportional(12.0),
-                                    TEXT,
-                                );
-                                ui.add(
-                                    egui::ProgressBar::new(progress as f32)
-                                        .desired_width(ui.available_width())
-                                        .corner_radius(8)
-                                        .fill(phase_tint)
-                                        .text(if self.pacer_enabled {
-                                            "4 sec in  ·  6 sec out"
-                                        } else {
-                                            "Pacer disabled"
-                                        }),
-                                );
-                            });
-
-                            cols[1].columns(2, |metrics| {
-                                let hr = if snap.hr > 0.0 {
-                                    format!("{:.0}", snap.hr)
-                                } else {
-                                    "—".to_owned()
-                                };
-                                let ibi = if snap.ibi > 0.0 {
-                                    format!("{:.0}", snap.ibi)
-                                } else {
-                                    "—".to_owned()
-                                };
-                                metric_card(&mut metrics[0], "HEART RATE", &hr, "bpm", RED);
-                                metric_card(&mut metrics[1], "INTER-BEAT", &ibi, "ms", BLUE);
-                            });
-                            cols[1].add_space(10.0);
-                            card().show(&mut cols[1], |ui| {
-                                ui.set_min_height(112.0);
-                                ui.horizontal(|ui| {
-                                    section_label(ui, "RESONANCE ALIGNMENT");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| pill(ui, state, state_tint),
-                                    );
-                                });
-                                let score = snap.res.map(|r| r.score).unwrap_or(0.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(if snap.res.is_some() {
-                                            format!("{score:.0}")
-                                        } else {
-                                            "—".to_owned()
-                                        })
-                                        .size(40.0)
-                                        .strong()
-                                        .color(TEXT),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("%")
-                                            .size(17.0)
-                                            .color(MUTED),
-                                    );
-                                });
-                                ui.add(
-                                    egui::ProgressBar::new((score / 100.0) as f32)
-                                        .desired_width(ui.available_width())
-                                        .corner_radius(8)
-                                        .fill(state_tint)
-                                        .text(""),
-                                );
-                                let detail = snap
-                                    .res
-                                    .map(|r| {
-                                        format!(
-                                            "peak {:.3} Hz  ·  LF {:.0}%  ·  HF {:.0}%  ·  LF/HF {:.1}",
-                                            r.peak_freq, r.lf_nu, r.hf_nu, r.lf_hf
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "collecting clean beats…".to_owned());
-                                ui.label(
-                                    egui::RichText::new(detail)
-                                        .size(12.0)
-                                        .color(MUTED),
-                                );
-                            });
-                        });
-
-                        ui.add_space(12.0);
-
-                        card().show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                section_label(ui, "HEART RHYTHM");
-                                let chart_detail = snap
-                                    .hrv
-                                    .map(|h| {
-                                        format!(
-                                            "{} beats  ·  {} artifacts  ·  RSA span {:.0} ms",
-                                            snap.beats, snap.artifacts, h.hr_max_min
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "{} beats  ·  {} artifacts",
-                                            snap.beats, snap.artifacts
-                                        )
-                                    });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(chart_detail)
-                                                .size(11.0)
-                                                .color(MUTED),
-                                        );
-                                    },
-                                );
-                            });
-                            let (grect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 134.0),
-                                egui::Sense::hover(),
-                            );
-                            let painter = ui.painter_at(grect);
-                            painter.rect_filled(grect, 11.0, CHART_BG);
-                            painter.rect_stroke(
-                                grect,
-                                11.0,
-                                egui::Stroke::new(1.0, BORDER),
-                                egui::StrokeKind::Inside,
-                            );
-                            for i in 1..4 {
-                                let y = egui::lerp(grect.top()..=grect.bottom(), i as f32 / 4.0);
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(grect.left() + 8.0, y),
-                                        egui::pos2(grect.right() - 8.0, y),
-                                    ],
-                                    egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgb(27, 38, 49),
-                                    ),
-                                );
-                            }
-
-                            let series = &snap.series;
-                            if series.len() >= 2 {
-                                let lo =
-                                    series.iter().cloned().fold(f64::INFINITY, f64::min) - 35.0;
-                                let hi = series
-                                    .iter()
-                                    .cloned()
-                                    .fold(f64::NEG_INFINITY, f64::max)
-                                    + 35.0;
-                                let range = (hi - lo).max(100.0);
-                                let points: Vec<egui::Pos2> = series
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, &v)| {
-                                        let x = grect.left()
-                                            + 10.0
-                                            + (i as f32 / (series.len() - 1) as f32)
-                                                * (grect.width() - 20.0);
-                                        let y = grect.bottom()
-                                            - 10.0
-                                            - (((v - lo) / range) as f32)
-                                                * (grect.height() - 20.0);
-                                        egui::pos2(x, y)
-                                    })
-                                    .collect();
-                                painter.add(egui::Shape::line(
-                                    points.clone(),
-                                    egui::Stroke::new(2.2, ACCENT),
-                                ));
-                                if let Some(last) = points.last() {
-                                    painter.circle_filled(*last, 4.5, ACCENT);
-                                    painter.circle_stroke(
-                                        *last,
-                                        7.5,
-                                        egui::Stroke::new(
-                                            1.0,
-                                            egui::Color32::from_rgba_premultiplied(
-                                                ACCENT.r(),
-                                                ACCENT.g(),
-                                                ACCENT.b(),
-                                                90,
-                                            ),
-                                        ),
-                                    );
-                                }
-                                painter.text(
-                                    grect.left_top() + egui::vec2(12.0, 10.0),
-                                    egui::Align2::LEFT_TOP,
-                                    format!("{hi:.0}"),
-                                    egui::FontId::monospace(10.0),
-                                    MUTED,
-                                );
-                                painter.text(
-                                    grect.left_bottom() + egui::vec2(12.0, -10.0),
-                                    egui::Align2::LEFT_BOTTOM,
-                                    format!("{lo:.0}"),
-                                    egui::FontId::monospace(10.0),
-                                    MUTED,
-                                );
-                            } else {
-                                painter.text(
-                                    grect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Waiting for clean beats…",
-                                    egui::FontId::proportional(14.0),
-                                    MUTED,
-                                );
-                            }
-                        });
-
-                        ui.add_space(10.0);
-
-                        ui.columns(4, |stats| {
-                            let rmssd = snap
-                                .hrv
-                                .map(|h| format!("{:.1}", h.rmssd))
-                                .unwrap_or_else(|| "—".to_owned());
-                            let sdnn = snap
-                                .hrv
-                                .map(|h| format!("{:.1}", h.sdnn))
-                                .unwrap_or_else(|| "—".to_owned());
-                            let pnn50 = snap
-                                .hrv
-                                .map(|h| format!("{:.1}", h.pnn50))
-                                .unwrap_or_else(|| "—".to_owned());
-                            let peak = snap
-                                .res
-                                .map(|r| format!("{:.1}", r.bpm))
-                                .unwrap_or_else(|| "—".to_owned());
-                            small_stat(&mut stats[0], "RMSSD", &rmssd, "ms · short-term HRV");
-                            small_stat(&mut stats[1], "SDNN", &sdnn, "ms · total variability");
-                            small_stat(&mut stats[2], "pNN50", &pnn50, "% · successive beats");
-                            small_stat(&mut stats[3], "PEAK RATE", &peak, "bpm · dominant rhythm");
-                        });
+                            mobile_dashboard(ui, &snap, self);
                         }
                     });
             });
@@ -968,9 +1464,14 @@ impl eframe::App for App {
     }
 }
 
-fn spawn_reader(shared: &Arc<Mutex<Snapshot>>, platform: emwave::AndroidContext) {
+fn spawn_reader(
+    shared: &Arc<Mutex<Snapshot>>,
+    session_samples: &Arc<Mutex<Vec<archive::BeatRecord>>>,
+    platform: emwave::AndroidContext,
+) {
     let reader_shared = shared.clone();
-    std::thread::spawn(move || reader_loop(reader_shared, platform));
+    let reader_samples = session_samples.clone();
+    std::thread::spawn(move || reader_loop(reader_shared, reader_samples, platform));
 }
 
 fn native_options() -> eframe::NativeOptions {
@@ -985,11 +1486,12 @@ fn native_options() -> eframe::NativeOptions {
 #[cfg(not(target_os = "android"))]
 pub fn desktop_main() -> eframe::Result {
     let shared = Arc::new(Mutex::new(Snapshot::default()));
-    spawn_reader(&shared, emwave::AndroidContext);
+    let session_samples = Arc::new(Mutex::new(Vec::new()));
+    spawn_reader(&shared, &session_samples, emwave::AndroidContext);
     eframe::run_native(
         "Resonance",
         native_options(),
-        Box::new(move |cc| Ok(Box::new(App::new(cc, shared)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, session_samples)))),
     )
 }
 
@@ -1000,14 +1502,17 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         vm: app.vm_as_ptr() as usize,
         activity: app.activity_as_ptr() as usize,
     };
+    let _ = emwave::set_keep_screen_on(platform, true);
     let shared = Arc::new(Mutex::new(Snapshot::default()));
-    spawn_reader(&shared, platform);
+    let session_samples = Arc::new(Mutex::new(Vec::new()));
+    spawn_reader(&shared, &session_samples, platform);
     let mut options = native_options();
     options.android_app = Some(app);
     let _ = eframe::run_native(
         "Resonance",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, shared)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, session_samples)))),
     );
+    let _ = emwave::set_keep_screen_on(platform, false);
 }
  

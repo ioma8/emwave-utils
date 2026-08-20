@@ -228,21 +228,10 @@ Sequence that produced data: open → feature 'I' (38B) → feature 't' (9B) →
 
 ## 2026-08-19 — Part 6: Live HR/HRV/coherence TUI
 
-File: `emwave_tui.py` (curses + numpy, no other deps).
-- Live HR (from `<2 I=.. H=..>` records), last IBI, beat count, artifacts.
-- Scrolling IBI trend graph (60-ms-scaled rows, terminal-width columns).
-- HRV (rolling window, default 240 beats): SDNN, RMSSD, mean RR, mean HR.
-- Coherence estimate: NN series interpolated to 4 Hz, Hanning-window FFT, peak power in
-  0.04-0.26 Hz band / total HRV power (VLF+LF+HF) -> 0-100% + LOW/MEDIUM/HIGH.
-- `--dump N` non-curses metric mode (validated live: HR 72-100 bpm, SDNN ~40 ms,
-  RMSSD ~35 ms, coherence 37-74% tracking rhythm changes).
-
-### Next: hook dylib (`hook_hid.m` -> `hook_hid.dylib`, launcher `run_hooked.sh`)
-App entitlements (`allow-dyld-environment-variables`, `disable-library-validation`)
-permit DYLD_INSERT_LIBRARIES. The hook logs every IOHIDDeviceSetReport/GetReport/
-RegisterInputReportCallback/Open/Close to `/tmp/hid_hook.log`. Running the app's
-File→Sync under the hook reveals the app's EXACT transfer sequence for replication
-in `emwave2.py`.
+Historical note: the former Python curses TUI and temporary HID-hook tooling were
+removed after the protocol was mapped and the Rust `training/` app became canonical.
+The protocol evidence remains in this log; current desktop/Android behavior lives in
+`training/src/`.
 
 ## 2026-08-19 — Part 7: Android APK port
 
@@ -289,3 +278,141 @@ in `emwave2.py`.
 - Persistent log then showed repeated `interface is busy (errno 16)`.
 - Root cause: normal `nusb::claim_interface` loses to Android's system HID driver.
 - Android backend changed to `detach_and_claim_interface(0)`; desktop transport unchanged.
+
+## 2026-08-19 — Part 9: Rolling graph and session history
+
+- The Rust graph uses a bounded last-120-beat buffer; it cannot grow indefinitely. HRV
+  analysis retains up to 240 clean beats.
+- Added persistent `sessions.json`:
+  - desktop: `~/.emwave-resonance/sessions.json`;
+  - Android: `/sdcard/Android/data/com.emwave.resonance/files/sessions.json`.
+- Each app session records start date/time, duration, mean HR, mean resonance score,
+  clean beats, and artifact count.
+- Added Train / Sessions navigation and a previous-session browser.
+- Added dedicated portrait stacking so the session view and trainer fit narrow screens.
+
+### Session persistence correction
+- Sessions are finalized both when the HID reader reports a device disconnect and when
+  the app exits.
+- Records are deduplicated by session start timestamp, so disconnect + shutdown cannot
+  create duplicate history rows.
+- The graph remains a bounded 120-sample view while the HRV analysis window remains
+  240 clean beats.
+
+### Session/display behavior
+- Session history now finalizes on HID disconnect as well as application shutdown;
+  records are deduplicated by start timestamp.
+- Android uses `FLAG_KEEP_SCREEN_ON` while the training activity is running and clears
+  it when the activity exits.
+
+### Session-history Android crash diagnosis
+- A physical Pixel 9 crash showed `JNIEnv::call_method` receiving a null object in
+  Android USB enumeration when no emWave2 was attached.
+- Added null checks for Activity, UsbManager, device map, collection, iterator, device,
+  and `openDevice` connection.
+- Rebuilt and installed the null-safe APK; process stays alive with the phone connected
+  to ADB and the emWave2 absent.
+
+### Personal resonant-rate finder
+- Added a `FIND RATE` screen with one-minute paced-breathing trials at 4.5, 5.0,
+  5.5, 6.0, 6.5, and 7.0 breaths/min.
+- The finder shows the animated breath pacer and offers either one selected trial or
+  one automatic six-minute sequence covering every rate.
+- Each result uses the completed trial's latest 60-second resonance estimate, ranks
+  completed rates by score, and reports the dominant peak.
+- Fixed session history loss: USB open errors now preserve the loaded session list, and
+  disconnect persistence updates the snapshot before it is published.
+
+### Target-frequency finder correction
+- Replaced the six one-minute trials with sequential 4.5, 5.5, and 7.0
+  breaths/min trials lasting two minutes each.
+- Trial scoring now projects the NN series at the exact paced frequency, locates the
+  strongest LF peak on an oversampled frequency grid, and penalizes peak mismatch.
+- A result is called a match only when the LF peak is within 0.5 bpm of the paced rate
+  and the target-frequency score is at least 35/100; otherwise the UI reports no match.
+
+### Analysis audit
+- Trial and live spectrum preprocessing now removes linear NN drift before the Hann
+  taper; subtracting only the mean could leak slow trend energy into the LF peak.
+- Synthetic tests confirm a target-frequency oscillation is accepted and a mismatched
+  target is rejected.
+- The two-minute trials remain exploratory; they are not interchangeable with a
+  standards-grade five-minute LF/HF measurement.
+
+### Beat-analysis audit
+- Verified parser framing, artifact flag handling, cumulative physiological timing,
+  NN-only HRV inputs, sample-variance SDNN, successive-difference RMSSD, and pNN50.
+- Session mean HR now excludes artifact-marked beats; the displayed RSA span is explicitly
+  named as an NN interval range in milliseconds.
+- Added regression tests for the time-domain formulas and artifact-excluded mean HR.
+
+### Full session beat archives
+- Each saved session now stores every received beat with physiological timestamp,
+  IBI, heart rate, and artifact flag.
+- Session history exposes `VIEW GRAPH`; clean NN intervals render in green and
+  artifact-marked intervals in red.
+- Older summary-only sessions remain readable and show `NO ARCHIVE`.
+- Finder rows now expose target-power share and LF-normalized power, making `NO MATCH`
+  diagnosable instead of only showing a final score.
+
+### Raw-session replay finding
+- The latest archive contained only 126.3 wall-clock seconds and 233 clean beats;
+  the log shows the emWave2 disconnected at 126 seconds, before a three-trial run
+  could complete.
+- Its physiological NN timeline spans about 183 seconds, indicating the device
+  delivered buffered samples faster than wall time.
+- Independent replay found the dominant LF peak around 2.8–2.9 bpm; target power was
+  negligible at 4.5 and 7.0 bpm and about 2% of the dominant peak at 5.5 bpm.
+- Therefore `NO MATCH` is correct for that archive; it does not contain evidence of
+  target-rate entrainment.
+- Finder now aborts an active sequence on USB disconnect instead of scoring stale or
+  incomplete data.
+
+### Receipt-time trial segmentation
+- Archived samples now include both physiological IBI time and wall-clock receipt time.
+- Finder trial boundaries use receipt time, preventing buffered HID reports from extending a
+  nominal two-minute trial to a different physiological span.
+- USB disconnect now aborts the active trial and prevents stale data from being scored.
+
+### Trial response score semantics
+- Trial score now measures response power at the tested rate independently of peak
+  mismatch.
+- `MATCH` is a separate classification requiring a dominant LF peak within the
+  tolerance; an off-target trial retains its nonzero target-response score.
+- Added a synthetic mixed-signal regression test proving an off-target dominant peak
+  does not erase a nonzero target score.
+
+### Partial trial scoring
+- Trials with at least 60 seconds of receipt-time data now retain a numerical target
+  response score even when the two-minute run is interrupted.
+- Such results are labeled `PARTIAL` and cannot become the reliable best match.
+
+### Latest no-data replay
+- The newest session contained 247 archived samples, 240 clean beats, 6 artifacts,
+  and only 130.9 seconds of receipt time.
+- The USB log shows the device disconnecting at 132 seconds, so the previous
+  `NO DATA` result came from the 108-second complete-trial gate after a late trial
+  start, not from an empty beat stream.
+- Partial trials with at least 60 seconds now retain a score and are labeled `PARTIAL`;
+  only at least 108 seconds can produce a reliable `MATCH`.
+
+### Two-session calculation validation
+- Independent replay of the two newest archives matched the Rust spectral algorithm:
+  both sessions peak at approximately 2.8–3.0 bpm, with LF normalized power above 96%.
+- Neither archive contains a target-rate peak at 4.5, 5.5, or 7.0 bpm; the `NO MATCH`
+  classification is supported by the data.
+- Found and fixed one summary mismatch: session mean HR averaged the device `H=` field
+  while HRV used IBI intervals. Mean HR now derives from clean `60000 / IBI`.
+
+### Short-sample scoring
+- Partial trial scoring now accepts at least 30 seconds of receipt-time data, returns
+  the target-frequency response score, and labels the row `PARTIAL`.
+- Reliable `MATCH` still requires at least 108 seconds, preserving the distinction
+  between an exploratory short estimate and a complete trial.
+
+### Research-aligned finder protocol
+- Finder now runs the adult assessment range 6.5, 6.0, 5.5, 5.0, 4.5 breaths/min.
+- Automatic runs insert two-minute natural-breathing rests between two-minute trials.
+- Results are labeled cardiac PPG candidates; the app does not claim phase-verified
+  resonance without a synchronized respiration channel.
+- Complete trials still require at least 108 seconds of data for reliable matching.
