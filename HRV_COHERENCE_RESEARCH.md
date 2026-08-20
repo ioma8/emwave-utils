@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-The Rust `training/` app reports standardized HRV metrics and a transparent
+The Rust app reports standardized HRV metrics and a transparent
 cardiac PPG target-frequency heuristic. It does not use HeartMath's proprietary
 coherence formula (excluded per project decision; see §5).
 
@@ -96,7 +96,7 @@ HeartMath's coherence ratio — peak power in a 0.030-Hz window centered on the 
 0.04–0.26 Hz, divided by (total − peak) — is described publicly (McCraty 2022,
 [PMC9214473](https://pmc.ncbi.nlm.nih.gov/articles/PMC9214473/)) but the exact
 preprocessing, windowing, artifact correction, and ratio→Low/Medium/High score mapping are
-proprietary and not reproducible. Per project decision, the Rust `training/` app uses only
+proprietary and not reproducible. Per project decision, the Rust app uses only
 the standardized metrics and transparent cardiac target-frequency heuristic; it does not
 claim emWave-equivalent scores.
 
@@ -257,7 +257,7 @@ alignment as proxies, but must not label them “baroreflex gain.”
   breathing could worsen acidosis require clinical screening; this is not a self-administered
   diagnostic maneuver.
 
-### Practical recommendation for `training/`
+### Practical recommendation for the app
 
 The app has a PPG-derived IBI stream and an explicit multi-rate finder, but no synchronized
 respiration channel and no direct blood-pressure measurement. Its LF peak/concentration and

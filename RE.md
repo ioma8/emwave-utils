@@ -229,13 +229,13 @@ Sequence that produced data: open → feature 'I' (38B) → feature 't' (9B) →
 ## 2026-08-19 — Part 6: Live HR/HRV/coherence TUI
 
 Historical note: the former Python curses TUI and temporary HID-hook tooling were
-removed after the protocol was mapped and the Rust `training/` app became canonical.
-The protocol evidence remains in this log; current desktop/Android behavior lives in
-`training/src/`.
+removed after the protocol was mapped and the root Rust app became canonical.
+The protocol evidence remains in this log; current desktop/Android behavior lives
+in `src/`.
 
 ## 2026-08-19 — Part 7: Android APK port
 
-- Shared egui UI/metrics moved into `training/src/lib.rs`; desktop keeps a thin binary wrapper.
+- Shared egui UI/metrics live in `src/`; desktop keeps a thin binary wrapper.
 - Desktop transport remains `hidapi`.
 - Android transport uses Android `UsbManager` via JNI:
   - enumerates VID `0x0E30` / PID `0x0008`;
