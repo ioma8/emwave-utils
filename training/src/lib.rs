@@ -118,6 +118,7 @@ struct HeartStream {
     last_hr: f64,
     last_ibi: f64,
     artifacts: usize,
+    clean_beats_total: usize,
     beat_time: f64,
     started: Instant,
     started_unix: i64,
@@ -137,6 +138,7 @@ impl HeartStream {
             last_hr: 0.0,
             last_ibi: 0.0,
             artifacts: 0,
+            clean_beats_total: 0,
             beat_time: 0.0,
             started: Instant::now(),
             started_unix: SystemTime::now()
@@ -163,6 +165,7 @@ impl HeartStream {
         if b.artifact {
             self.artifacts += 1;
         } else {
+            self.clean_beats_total += 1;
             self.ibis.push(self.beat_time, b.ibi_ms);
             self.ibis.trim_to(WINDOW_BEATS);
             if let Some(res) = metrics::resonance(&self.ibis) {
@@ -182,7 +185,7 @@ impl HeartStream {
             status: status.to_string(),
             hr: self.last_hr,
             ibi: self.last_ibi,
-            beats: self.ibis.len(),
+            beats: self.clean_beats_total,
             artifacts: self.artifacts,
             elapsed: self.started.elapsed().as_secs_f64(),
             mean_hr: if self.hr_count > 0 {
@@ -451,251 +454,224 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-fn metric_card(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &str,
-    unit: &str,
-    accent: egui::Color32,
-) {
-    card().show(ui, |ui| {
-        ui.set_min_height(78.0);
-        section_label(ui, label);
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(value)
-                    .size(34.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.label(egui::RichText::new(unit).size(13.0).color(MUTED));
-        });
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2.0, accent);
-    });
-}
-
-fn small_stat(ui: &mut egui::Ui, label: &str, value: &str, caption: &str) {
-    egui::Frame::new()
-        .fill(CARD_ALT)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .corner_radius(13)
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_min_height(58.0);
-            section_label(ui, label);
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(value)
-                    .size(19.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.label(egui::RichText::new(caption).size(11.0).color(MUTED));
-        });
-}
 
 fn duration(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
     format!("{:02}:{:02}", total / 60, total % 60)
 }
+fn compact_stat(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
+    ui.vertical(|ui| {
+        section_label(ui, label);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(value).size(20.0).strong().color(TEXT));
+            ui.label(egui::RichText::new(unit).size(10.0).color(MUTED));
+        });
+    });
+}
 fn mobile_dashboard(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
     let state = snap.res.map(|r| r.state).unwrap_or("BUILDING");
     let state_tint = state_color(state);
+    let pacer_live = snap.connected && app.pacer_enabled;
+    let (phase, progress, amount) = if pacer_live {
+        app.pacer()
+    } else {
+        ("PAUSED", 0.0, 0.0)
+    };
+    let tint = if !pacer_live {
+        MUTED
+    } else if phase == "INHALE" {
+        ACCENT
+    } else {
+        BLUE
+    };
 
-    card().show(ui, |ui| {
+    card().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         ui.horizontal(|ui| {
             section_label(ui, "BREATH PACER");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut app.pacer_enabled, "Enabled");
+                ui.add_enabled_ui(snap.connected, |ui| {
+                    ui.checkbox(&mut app.pacer_enabled, "Enabled");
+                });
             });
         });
-        ui.label(
-            egui::RichText::new(if app.pacer_enabled {
-                "Follow the circle gently"
-            } else {
-                "Pacer paused · measurements continue"
-            })
-            .size(13.0)
-            .color(MUTED),
-        );
-        let (phase, progress, amount) = if app.pacer_enabled {
-            app.pacer()
-        } else {
-            ("PAUSED", 0.0, 0.0)
-        };
-        let tint = if !app.pacer_enabled {
-            MUTED
-        } else if phase == "INHALE" {
-            ACCENT
-        } else {
-            BLUE
-        };
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::hover());
-        let center = rect.center();
-        let painter = ui.painter();
-        painter.circle_filled(center, 68.0, egui::Color32::from_rgb(12, 19, 26));
-        painter.circle_stroke(center, 68.0, egui::Stroke::new(1.0, BORDER));
-        let radius = 30.0 + 32.0 * amount as f32;
-        painter.circle_filled(
-            center,
-            radius,
-            egui::Color32::from_rgba_premultiplied(tint.r(), tint.g(), tint.b(), 52),
-        );
-        painter.circle_stroke(center, radius, egui::Stroke::new(3.0, tint));
-        painter.text(
-            center - egui::vec2(0.0, 6.0),
-            egui::Align2::CENTER_CENTER,
-            phase,
-            egui::FontId::proportional(18.0),
-            TEXT,
-        );
-        painter.text(
-            center + egui::vec2(0.0, 16.0),
-            egui::Align2::CENTER_CENTER,
-            format!("{:.1} breaths / min", app.pacer_rate),
-            egui::FontId::proportional(11.0),
-            TEXT,
-        );
-        ui.add(
-            egui::ProgressBar::new(progress as f32)
-                .desired_width(ui.available_width())
-                .corner_radius(8)
-                .fill(tint)
-                .text(if app.pacer_enabled {
-                    format!("{:.1} breaths / min", app.pacer_rate)
-                } else {
-                    "Pacer disabled".to_owned()
-                }),
-        );
-    });
-
-    ui.add_space(10.0);
-
-    let hr = if snap.hr > 0.0 {
-        format!("{:.0}", snap.hr)
-    } else {
-        "—".to_owned()
-    };
-    let ibi = if snap.ibi > 0.0 {
-        format!("{:.0}", snap.ibi)
-    } else {
-        "—".to_owned()
-    };
-    ui.columns(2, |cols| {
-        metric_card(&mut cols[0], "HEART RATE", &hr, "bpm", RED);
-        metric_card(&mut cols[1], "INTER-BEAT", &ibi, "ms", BLUE);
-    });
-
-    ui.add_space(10.0);
-    card().show(ui, |ui| {
         ui.horizontal(|ui| {
-            section_label(ui, "RESONANCE ALIGNMENT");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pill(ui, state, state_tint);
-            });
-        });
-        let score = snap.res.map(|r| r.score).unwrap_or(0.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(if snap.res.is_some() {
-                    format!("{score:.0}")
-                } else {
-                    "—".to_owned()
-                })
-                .size(38.0)
-                .strong()
-                .color(TEXT),
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 96.0), egui::Sense::hover());
+            let center = rect.center();
+            let painter = ui.painter_at(rect);
+            let radius = 24.0 + 25.0 * amount as f32;
+            painter.circle_filled(center, 46.0, CHART_BG);
+            painter.circle_stroke(center, 46.0, egui::Stroke::new(1.0, BORDER));
+            painter.circle_filled(
+                center,
+                radius,
+                egui::Color32::from_rgba_premultiplied(tint.r(), tint.g(), tint.b(), 52),
             );
-            ui.label(egui::RichText::new("%").size(16.0).color(MUTED));
+            painter.circle_stroke(center, radius, egui::Stroke::new(2.0, tint));
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                phase,
+                egui::FontId::proportional(13.0),
+                TEXT,
+            );
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{:.1} breaths/min", app.pacer_rate))
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(if !snap.connected {
+                        "Connect emWave2 to start the session"
+                    } else if app.pacer_enabled {
+                        "Follow the circle"
+                    } else {
+                        "Measurements continue"
+                    })
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                ui.add(
+                    egui::ProgressBar::new(progress as f32)
+                        .desired_width(ui.available_width())
+                        .fill(tint)
+                        .text(""),
+                );
+            });
         });
-        ui.add(
-            egui::ProgressBar::new((score / 100.0) as f32)
-                .desired_width(ui.available_width())
-                .corner_radius(8)
-                .fill(state_tint)
-                .text(""),
-        );
-        let detail = snap
-            .res
-            .map(|r| format!("peak {:.1} bpm  ·  LF {:.0}%  ·  HF {:.0}%", r.bpm, r.lf_nu, r.hf_nu))
-            .unwrap_or_else(|| "collecting clean beats…".to_owned());
-        ui.label(egui::RichText::new(detail).size(12.0).color(MUTED));
     });
 
-    ui.add_space(10.0);
-    card().show(ui, |ui| {
+    card()
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_min_height(88.0);
+            ui.horizontal(|ui| {
+                section_label(ui, "CARDIAC ALIGNMENT");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pill(ui, state, state_tint);
+                });
+            });
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let score = snap.res.map(|r| r.score).unwrap_or(0.0);
+                ui.label(
+                    egui::RichText::new(if snap.res.is_some() {
+                        format!("{score:.0}")
+                    } else {
+                        "—".to_owned()
+                    })
+                    .size(32.0)
+                    .strong()
+                    .color(TEXT),
+                );
+                if snap.res.is_some() {
+                    ui.label(egui::RichText::new("%").size(12.0).color(MUTED));
+                }
+                ui.add(
+                    egui::ProgressBar::new((score / 100.0) as f32)
+                        .desired_width(ui.available_width())
+                        .corner_radius(6)
+                        .fill(state_tint)
+                        .text(""),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    snap.res
+                        .map(|r| format!("peak {:.1} bpm  ·  LF {:.0}%  ·  HF {:.0}%", r.bpm, r.lf_nu, r.hf_nu))
+                        .unwrap_or_else(|| "Collecting clean beats…".to_owned()),
+                )
+                .size(10.0)
+                .color(MUTED),
+            );
+        });
+
+    ui.add_space(6.0);
+    card().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.columns(2, |cols| {
+            let hr = if snap.hr > 0.0 {
+                format!("{:.0}", snap.hr)
+            } else {
+                "—".to_owned()
+            };
+            let ibi = if snap.ibi > 0.0 {
+                format!("{:.0}", snap.ibi)
+            } else {
+                "—".to_owned()
+            };
+            compact_stat(&mut cols[0], "HEART RATE", &hr, "bpm");
+            compact_stat(&mut cols[1], "INTER-BEAT", &ibi, "ms");
+        });
+    });
+
+    ui.add_space(6.0);
+    card().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         ui.horizontal(|ui| {
             section_label(ui, "HEART RHYTHM");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new(format!("{} beats", snap.beats))
-                        .size(11.0)
+                    egui::RichText::new(format!("{} beats · {} artifacts", snap.beats, snap.artifacts))
+                        .size(10.0)
                         .color(MUTED),
                 );
             });
         });
         let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 145.0), egui::Sense::hover());
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 11.0, CHART_BG);
-        let series = &snap.series;
-        if series.len() >= 2 {
-            let lo = series.iter().cloned().fold(f64::INFINITY, f64::min) - 35.0;
-            let hi = series.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 35.0;
-            let range = (hi - lo).max(100.0);
-            let points: Vec<egui::Pos2> = series
+        painter.rect_filled(rect, 8.0, CHART_BG);
+        if snap.series.len() >= 2 {
+            let lo = snap.series.iter().cloned().fold(f64::INFINITY, f64::min) - 25.0;
+            let hi = snap.series.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 25.0;
+            let range = (hi - lo).max(80.0);
+            let points: Vec<egui::Pos2> = snap
+                .series
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| {
-                    let x = rect.left() + 8.0
-                        + (i as f32 / (series.len() - 1) as f32) * (rect.width() - 16.0);
-                    let y = rect.bottom() - 8.0
-                        - (((v - lo) / range) as f32) * (rect.height() - 16.0);
+                .map(|(i, &value)| {
+                    let x = rect.left()
+                        + 6.0
+                        + i as f32 / (snap.series.len() - 1) as f32 * (rect.width() - 12.0);
+                    let y = rect.bottom()
+                        - 6.0
+                        - ((value - lo) / range) as f32 * (rect.height() - 12.0);
                     egui::pos2(x, y)
                 })
                 .collect();
-            painter.add(egui::Shape::line(points, egui::Stroke::new(2.0, ACCENT)));
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, ACCENT)));
         } else {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Waiting for clean beats…",
-                egui::FontId::proportional(13.0),
+                egui::FontId::proportional(11.0),
                 MUTED,
             );
         }
+        ui.columns(4, |cols| {
+            let rmssd = snap.hrv.map(|h| format!("{:.1}", h.rmssd)).unwrap_or_else(|| "—".to_owned());
+            let sdnn = snap.hrv.map(|h| format!("{:.1}", h.sdnn)).unwrap_or_else(|| "—".to_owned());
+            let pnn50 = snap.hrv.map(|h| format!("{:.1}", h.pnn50)).unwrap_or_else(|| "—".to_owned());
+            let peak = snap.res.map(|r| format!("{:.1}", r.bpm)).unwrap_or_else(|| "—".to_owned());
+            compact_stat(&mut cols[0], "RMSSD", &rmssd, "ms");
+            compact_stat(&mut cols[1], "SDNN", &sdnn, "ms");
+            compact_stat(&mut cols[2], "pNN50", &pnn50, "%");
+            compact_stat(&mut cols[3], "PEAK", &peak, "bpm");
+        });
+        ui.label(
+            egui::RichText::new(snap.status.as_str())
+                .size(9.0)
+                .color(MUTED),
+        );
     });
-
-    ui.add_space(10.0);
-    ui.columns(2, |cols| {
-        let rmssd = snap.hrv.map(|h| format!("{:.1}", h.rmssd)).unwrap_or_else(|| "—".to_owned());
-        let sdnn = snap.hrv.map(|h| format!("{:.1}", h.sdnn)).unwrap_or_else(|| "—".to_owned());
-        // Second row values are intentionally scoped here.
-        small_stat(&mut cols[0], "RMSSD", &rmssd, "ms · short-term HRV");
-        small_stat(&mut cols[1], "SDNN", &sdnn, "ms · total variability");
-    });
-    ui.add_space(8.0);
-    ui.columns(2, |cols| {
-        let pnn50 = snap.hrv.map(|h| format!("{:.1}", h.pnn50)).unwrap_or_else(|| "—".to_owned());
-        let peak = snap.res.map(|r| format!("{:.1}", r.bpm)).unwrap_or_else(|| "—".to_owned());
-        small_stat(&mut cols[0], "pNN50", &pnn50, "% · successive beats");
-        small_stat(&mut cols[1], "PEAK RATE", &peak, "bpm · dominant rhythm");
-    });
-
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(format!("{} artifacts  ·  {}", snap.artifacts, snap.status))
-            .size(11.0)
-            .color(MUTED),
-    );
 }
 
 
 fn finder_pacer(ui: &mut egui::Ui, app: &App) {
+    if !app.finder.active {
+        return;
+    }
     if app.finder.resting {
         let elapsed = app
             .finder
@@ -786,25 +762,45 @@ fn resonance_finder(ui: &mut egui::Ui, snap: &Snapshot, app: &mut App) {
     }
     .min(period);
 
-    card().show(ui, |ui| {
-        section_label(ui, "PERSONAL RESONANT RATE");
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "Run five two-minute trials from 6.5 down to 4.5 breaths/min, with two-minute natural-breathing rests. This is a cardiac PPG heuristic; respiration is not measured.",
-            )
-            .size(14.0)
-            .color(TEXT),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(
-                "This is an indicative screen, not a clinical measurement. Stay seated, relaxed, and keep the ear clip still.",
-            )
-            .size(12.0)
-            .color(MUTED),
-        );
-    });
+    card()
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Find your cardiac candidate")
+                            .size(20.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new("PPG response heuristic · respiration not measured")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pill(ui, "ASSESSMENT", BLUE);
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                for text in [
+                    "5 rates",
+                    "2 min trial",
+                    "2 min natural rest",
+                    "6.5 → 4.5 bpm",
+                ] {
+                    egui::Frame::new()
+                        .fill(CARD_ALT)
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(7, 4))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(text).size(10.0).color(MUTED));
+                        });
+                }
+            });
+        });
 
     ui.add_space(10.0);
     finder_pacer(ui, app);
@@ -1366,6 +1362,20 @@ mod tests {
         });
         assert_eq!(stream.snapshot("test", true).mean_hr, 60.0);
     }
+    #[test]
+    fn archive_beat_count_exceeds_analysis_window() {
+        let mut stream = HeartStream::new(Vec::new());
+        for _ in 0..(WINDOW_BEATS + 17) {
+            stream.ingest(Beat {
+                ibi_ms: 1000.0,
+                artifact: false,
+                hr: 60.0,
+            });
+        }
+        let snapshot = stream.snapshot("test", true);
+        assert_eq!(snapshot.beats, WINDOW_BEATS + 17);
+        assert_eq!(stream.ibis.as_slice().len(), WINDOW_BEATS);
+    }
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -1380,6 +1390,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.shared.lock().unwrap().clone();
         self.finder.update(&snap);
+        if self.view == View::Finder {
+            self.pacer_rate = FINDER_RATES[self.finder.rate_index];
+            self.pacer_enabled = self.finder.active && !self.finder.resting;
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -1456,7 +1470,9 @@ impl eframe::App for App {
                     });
             });
 
-        ui.ctx().request_repaint_after(Duration::from_millis(if self.pacer_enabled {
+        ui.ctx().request_repaint_after(Duration::from_millis(if self.finder.active
+            || (snap.connected && self.pacer_enabled)
+        {
             50
         } else {
             250

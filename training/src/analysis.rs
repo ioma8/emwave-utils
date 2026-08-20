@@ -12,9 +12,6 @@ impl NnSeries {
         self.intervals.push((time_secs, ibi_ms));
     }
 
-    pub fn len(&self) -> usize {
-        self.intervals.len()
-    }
 
     pub fn as_slice(&self) -> &[(f64, f64)] {
         &self.intervals
